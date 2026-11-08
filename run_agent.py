@@ -28,7 +28,7 @@ def _writable_cwd():
             continue
 
 
-from harness.llm import LLM, Ledger, BudgetExhausted, ProxyDown, probe_budget  # noqa: E402
+from harness.llm import LLM, Ledger, BudgetExhausted, ProxyDown  # noqa: E402
 from harness.log import log  # noqa: E402
 from harness.solvers import SOLVERS, Infeasible  # noqa: E402
 from harness.tasks import load_tasks, analyze  # noqa: E402
@@ -81,7 +81,9 @@ def resolve_out(arg: str | None, tasks_dir: str) -> str:
             return out
         except OSError as e:
             log(f"[out] {out} not writable ({e}); falling back")
-    return os.path.join(tasks_dir, "answers.json")
+    # Not inside tasks_dir: the checker may treat every entry there as a task.
+    # The per-task answer.txt files are the contract; this JSON is a convenience copy.
+    return os.path.join(os.environ.get("TMPDIR", "/tmp"), "answers.json")
 
 
 async def main_async(args):
@@ -93,8 +95,6 @@ async def main_async(args):
     budget = args.budget or float(os.environ.get("TOKEN_BUDGET") or os.environ.get("BUDGET") or 0) or None
     ledger = Ledger(budget=budget)
     llm = LLM(ledger)
-    if os.environ.get("LLM_BASE_URL"):
-        probe_budget(os.environ["LLM_BASE_URL"], os.environ.get("LLM_API_KEY", ""))
     results = Results(resolve_out(args.out, args.tasks_dir))
     log(f"budget={budget} out={results.path}")
 
@@ -168,10 +168,12 @@ async def main_async(args):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--tasks-dir", default=os.environ.get("TASKS", "/data/tasks"))
-    ap.add_argument("--out", default=None)
+    ap.add_argument("--out", "--output", "--out-file", "--solutions", dest="out", default=None)
     ap.add_argument("--budget", type=float, default=None)
     ap.add_argument("--workers", type=int, default=5)
-    args = ap.parse_args()
+    args, unknown = ap.parse_known_args()
+    if unknown:  # never fail the run because of an unexpected flag
+        log(f"ignoring unknown arguments: {unknown}")
     args.tasks_dir = os.path.abspath(args.tasks_dir)
     if args.out:
         args.out = os.path.abspath(args.out)

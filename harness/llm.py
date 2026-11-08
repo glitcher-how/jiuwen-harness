@@ -73,6 +73,8 @@ class LLM:
         self.key = os.environ.get("LLM_API_KEY", "")
         self._models = {}
         self._fail_streak = 0
+        self._v1_state = "untried"  # untried -> trying -> done
+        self._base0 = self.base
         from openjiuwen.core.foundation.llm.model import Model
         from openjiuwen.core.foundation.llm.schema.config import (
             ModelClientConfig, ModelRequestConfig)
@@ -117,6 +119,19 @@ class LLM:
                 last_err = e
                 msg = str(e)
                 log(f"[llm] {tag} attempt {attempt} error: {msg[:300]}")
+                if re.search(r"\b404\b", msg):
+                    if self._v1_state == "untried" and not self.base.rstrip("/").endswith("/v1"):
+                        # LLM_BASE_URL may be given without /v1: try once with it
+                        self._v1_state, self._base0 = "trying", self.base
+                        self.base = self.base.rstrip("/") + "/v1"
+                        self._models.clear()
+                        log(f"[llm] 404, trying base URL {self.base}")
+                        continue
+                    if self._v1_state == "trying":
+                        # still 404, so the address was not the problem: put it back
+                        self._v1_state, self.base = "done", self._base0
+                        self._models.clear()
+                        log(f"[llm] still 404, base URL back to {self.base}")
                 rate = re.search(r"\b429\b|rate.?limit|too many requests|inflight|concurren", msg, re.I)
                 spent = re.search(r"\b(401|402|403)\b|budget|exhaust|insufficient|balance", msg, re.I)
                 if spent and not rate:
@@ -127,6 +142,8 @@ class LLM:
                 await asyncio.sleep(min(30, (5 if rate else 2) * (attempt + 1)))
                 continue
             self._fail_streak = 0
+            if self._v1_state == "trying":
+                self._v1_state = "done"  # the /v1 address works, keep it
             quiet_framework_logs()  # openJiuwen creates its loggers lazily on first use
             u = resp.usage_metadata
             inp = getattr(u, "input_tokens", 0) or 0
@@ -150,17 +167,3 @@ class LLM:
         if self._fail_streak >= 3:
             self.ledger.dead = True
         raise ProxyDown(str(last_err))
-
-
-def probe_budget(base: str, key: str) -> None:
-    """Log what the proxy says about limits (GET /limits). Informational only:
-    the numbers there are rate windows, not the competition budget, so the
-    planner never acts on them."""
-    import urllib.request
-    try:
-        req = urllib.request.Request(base.rstrip("/") + "/limits",
-                                     headers={"Authorization": f"Bearer {key}"})
-        with urllib.request.urlopen(req, timeout=8) as r:
-            log(f"[limits] {r.read().decode('utf-8', 'replace')[:800]}")
-    except Exception as e:
-        log(f"[limits] unavailable: {e}")
