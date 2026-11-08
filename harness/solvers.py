@@ -43,25 +43,38 @@ def _mental_math(code: str) -> bool:
     return len(body) == 1 and bool(re.fullmatch(r"print\(\s*-?[\d.]+\s*\)", body[0]))
 
 
-async def _program(task: Task, llm: LLM, user: str, model: str, max_tokens: int = 400) -> str:
-    msgs = [{"role": "system", "content": SYS_CODE}, {"role": "user", "content": user}]
+def _unused_numbers(problem: str, code: str) -> list:
+    """Numbers written in the problem that the program never mentions (as a multiset)."""
+    from collections import Counter
+    num = r"(?<![\w.])\d+(?:\.\d+)?(?![\w.])"
+    left = Counter(re.findall(num, problem)) - Counter(re.findall(num, code))
+    return sorted(left.elements(), key=float)
+
+
+async def _program(task: Task, llm: LLM, user: str, model: str, max_tokens: int = 400,
+                   system: str = "", retry_model: str = "", retry_tokens: int = 0) -> str:
+    msgs = [{"role": "system", "content": system or SYS_CODE}, {"role": "user", "content": user}]
     feedback = None
     if task.deferred:  # probably infeasible: one short try only
         max_tokens = min(max_tokens, 200)
     for attempt in range(1 if task.deferred else 2):
         m = msgs if feedback is None else msgs + feedback
-        reply = await llm.chat(m, model=model if attempt == 0 else MODELS["fast"],
-                               max_tokens=max_tokens, tag=f"{task.id}#{attempt}")
+        first = attempt == 0
+        reply = await llm.chat(m, model=model if first else (retry_model or MODELS["fast"]),
+                               max_tokens=max_tokens if first else (retry_tokens or max_tokens),
+                               tag=f"{task.id}#{attempt}")
         code = extract_code(reply)
         if not code:
             feedback = [{"role": "assistant", "content": reply},
                         {"role": "user", "content": "Reply with one ```python``` block only."}]
             continue
-        if task.kind == "math" and _mental_math(code) and attempt == 0 and not task.deferred:
-            # the model computed in its head (noreason models get arithmetic wrong)
+        # the reasoning model may legitimately fold steps or compute a part itself
+        doubt = (_math_doubt(task.question, code)
+                 if task.kind == "math" and model != MODELS["think"] else "")
+        if doubt and first and not task.deferred and IMPOSSIBLE not in code:
+            # free checks say a step was lost or computed in the head: ask again
             feedback = [{"role": "assistant", "content": f"```python\n{code}\n```"},
-                        {"role": "user", "content": "Do not compute in your head. Write the steps "
-                         "as Python statements starting from the numbers in the problem."}]
+                        {"role": "user", "content": doubt}]
             continue
         r = run_python(PRELUDE.get(task.kind, "") + code, task.cwd, timeout=30)
         ans = _answer_line(r.out) if r.ok else None
@@ -69,10 +82,8 @@ async def _program(task: Task, llm: LLM, user: str, model: str, max_tokens: int 
             raise Infeasible("model says impossible")
         if r.ok and ans:
             return _num_clean(ans)
-        if "ZeroDivisionError" in r.err:
+        if task.kind == "math" and "ZeroDivisionError" in r.err:
             raise Infeasible("division by zero")
-        if task.kind == "data_analysis" and re.search(r"KeyError|FileNotFoundError", r.err):
-            raise Infeasible("data lacks the column/file the question needs")
         feedback = [{"role": "assistant", "content": f"```python\n{code}\n```"},
                     {"role": "user", "content": "It failed:\n" + clip(r.err or r.out or "no output", 800)
                      + "\nFix it. One ```python``` block only."}]
@@ -81,8 +92,27 @@ async def _program(task: Task, llm: LLM, user: str, model: str, max_tokens: int 
 
 # ------------------------------------------------------------------ math
 
+def _math_doubt(problem: str, code: str) -> str:
+    """Zero-token sanity checks of a math program; returns what to tell the model."""
+    if _mental_math(code):
+        return ("Do not compute in your head. Write one assignment per sentence, starting "
+                "from the numbers in the problem.")
+    skipped = _unused_numbers(problem, code)
+    if skipped:
+        return ("Your program never uses these numbers from the problem: "
+                f"{', '.join(skipped)}. Apply every sentence, in order.")
+    return ""
+
+
 async def solve_math(task: Task, llm: LLM) -> Optional[str]:
-    return await _program(task, llm, task.question, MODELS["fast"], max_tokens=350)
+    # Only wordings the zero-token solver did not recognise get here. On such chains the
+    # model without reasoning loses or misreads a step about once in twenty tasks, and no
+    # free check catches all of those, so this path uses the reasoning model (low effort).
+    # A probably-infeasible task still gets one cheap try.
+    if task.deferred:
+        return await _program(task, llm, task.question, MODELS["fast"], max_tokens=350)
+    return await _program(task, llm, task.question, MODELS["think"], max_tokens=1500,
+                          retry_model=MODELS["think"], retry_tokens=1500)
 
 
 # ------------------------------------------------------------------ data analysis
@@ -102,8 +132,12 @@ def _conv(v):
 tables = {}
 for _f in sorted(_glob.glob('**/*.csv', recursive=True) + _glob.glob('**/*.tsv', recursive=True)):
     with open(_f, newline='', encoding='utf-8', errors='replace') as _h:
+        _head = _h.readline()
+        _h.seek(0)
+        _delim = max(',;\t|', key=_head.count)
+        _delim = _delim if _head.count(_delim) else ','
         tables[_f] = [{k: _conv(v) for k, v in r.items()}
-                      for r in _csv.DictReader(_h, delimiter='\t' if _f.endswith('.tsv') else ',')]
+                      for r in _csv.DictReader(_h, delimiter=_delim)]
 rows = next(iter(tables.values())) if len(tables) == 1 else None
 '''}
 
@@ -127,9 +161,10 @@ SYS_SEARCH = ("Answer the question using only the knowledge base. Facts may need
 
 
 async def solve_search(task: Task, llm: LLM) -> Optional[str]:
-    contexts = [task.context.get("kb", "")]
-    if task.context.get("kb_wide") and not task.deferred:
-        contexts.append(task.context["kb_wide"])  # second try with more linked cards
+    # Standard questions are answered by the zero-token solver. What reaches the model is
+    # unfamiliar wording, where the hop estimate behind the narrow context cannot be
+    # trusted, so the model gets the wider set of linked cards straight away.
+    contexts = [task.context.get("kb_wide") or task.context.get("kb", "")]
     for i, kb in enumerate(contexts):
         user = f"Knowledge base:\n{kb}\n\nQuestion: {task.question}"
         reply = await llm.chat([{"role": "system", "content": SYS_SEARCH},
@@ -245,6 +280,74 @@ def splice(original: str, patch: str) -> str:
     return out
 
 
+def _compact(target: str, src: str, cwd: str, tests, out: str) -> Optional[str]:
+    """Prompt with only the failing tests and the functions they call. Used only when
+    that view is complete: every function of the file is covered by some test (so a bug
+    cannot hide in code no test names) and the module has no other top-level state."""
+    import textwrap
+    from .deterministic import _FAILED, _test_map
+    failed = set(_FAILED.findall(out))
+    try:
+        tree = ast.parse(src)
+    except SyntaxError:
+        return None
+    defs = {}
+    for n in tree.body:
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            defs[n.name] = n
+        elif not isinstance(n, (ast.Import, ast.ImportFrom)):
+            return None  # classes, constants, module code: show the whole file
+    uses, methods = {}, {}
+    for tf in tests:
+        with open(os.path.join(cwd, tf), encoding="utf-8") as f:
+            tsrc = f.read()
+        u, _ = _test_map(tsrc, os.path.splitext(target)[0])
+        uses.update(u)
+        for n in ast.walk(ast.parse(tsrc)):
+            if isinstance(n, ast.FunctionDef) and n.name.startswith("test"):
+                methods[n.name] = textwrap.dedent(ast.get_source_segment(tsrc, n, padded=True))
+    covered = set().union(*uses.values()) if uses else set()
+    if not failed or not set(defs) <= covered:
+        return None
+    need = set()
+    for t in failed:
+        hit = uses.get(t, set()) & set(defs)
+        if not hit or t not in methods:
+            return None
+        need |= hit
+    while True:  # helpers the failing functions call
+        more = {x.id for f in need for x in ast.walk(defs[f])
+                if isinstance(x, ast.Name) and x.id in defs} - need
+        if not more:
+            break
+        need |= more
+    errors = []
+    for block in re.split(r"^={20,}\s*$", out, flags=re.M):
+        m = _FAILED.search(block)
+        e = re.search(r"^\w*(?:Error|Exception)\b.*$", block, re.M)
+        if m and e:
+            errors.append(f"{m.group(1)}: {e.group(0).strip()[:200]}")
+    imports = [ast.get_source_segment(src, n) for n in tree.body
+               if isinstance(n, (ast.Import, ast.ImportFrom))]
+    funcs = [ast.get_source_segment(src, defs[f]) for f in defs if f in need]
+    return ("### " + target + " (the failing functions)\n```python\n"
+            + "".join(i + "\n" for i in imports) + "\n\n\n".join(funcs) + "\n```\n\n"
+            "### failing tests\n" + "\n\n".join(methods[t] for t in sorted(failed))
+            + "\n\n" + "\n".join(errors))
+
+
+def _coding_prompt(target: str, src: str, cwd: str, tests, out: str) -> str:
+    short = _compact(target, src, cwd, tests, out)
+    if short:
+        return short
+    parts = []
+    for t in tests:
+        with open(os.path.join(cwd, t), encoding="utf-8") as f:
+            parts.append(f"### {t}\n" + f.read())
+    test_src = "\n\n".join(parts)
+    return f"### {target}\n```python\n{src}\n```\n\n{test_src}\n\nTest output:\n{clip(out, 1800)}"
+
+
 async def solve_coding(task: Task, llm: LLM) -> Optional[str]:
     cwd = task.cwd
     tests = _test_files(cwd)
@@ -262,11 +365,8 @@ async def solve_coding(task: Task, llm: LLM) -> Optional[str]:
         return await solve_generic(task, llm)
     tpath = os.path.join(cwd, target)
     original = open(tpath, encoding="utf-8").read()
-    test_src = "\n\n".join(f"### {t}\n" + open(os.path.join(cwd, t), encoding="utf-8").read()
-                           for t in tests)
-    base = (f"### {target}\n```python\n{original}\n```\n\n{test_src}\n\n"
-            f"Test output:\n{clip(out, 1800)}")
-    msgs = [{"role": "system", "content": SYS_FIX}, {"role": "user", "content": base}]
+    msgs = [{"role": "system", "content": SYS_FIX},
+            {"role": "user", "content": _coding_prompt(target, original, cwd, tests, out)}]
     plan = [(MODELS["fast"], 700)] + ([] if task.deferred else [(MODELS["fast"], 900)])
     if os.environ.get("CODING_ESCALATE", "1") != "0" and not task.deferred:
         plan.append((MODELS["think"], 3000))
@@ -295,8 +395,7 @@ async def solve_coding(task: Task, llm: LLM) -> Optional[str]:
                 return "DONE"
             # next round: show the current file and the new failures only
             msgs = [{"role": "system", "content": SYS_FIX},
-                    {"role": "user", "content": f"### {target}\n```python\n{current}\n```\n\n{test_src}"
-                                                f"\n\nTest output:\n{clip(out, 1800)}"}]
+                    {"role": "user", "content": _coding_prompt(target, current, cwd, tests, out)}]
         raise RuntimeError("tests still failing")
     finally:
         for t in tests:

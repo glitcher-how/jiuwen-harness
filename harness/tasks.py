@@ -24,6 +24,7 @@ class Task:
     why_infeasible: str = ""
     certain: bool = False       # infeasibility proven, not guessed: never attempt
     deferred: bool = False      # guessed infeasible: attempt last, once, if budget remains
+    det: bool = False           # solved by code, without the model
     context: Dict[str, str] = field(default_factory=dict)
     est_cost: float = 0.0
     status: str = "todo"
@@ -46,6 +47,7 @@ _BOILER = [
     r"Compute it with the bash tool[^.]*\.",
     r"Use bash with python3? to compute it\.",
     r"Use the file tools or bash[^.]*?(\([^)]*\))?[^.]*\.",
+    r"The directory [\w./-]+ contains a small knowledge base of markdown files\.",
 ]
 
 
@@ -247,6 +249,17 @@ def _an_search(t: Task) -> None:
 
 # --- data analysis: schema summary instead of raw file
 
+def sniff_delimiter(path: str) -> str:
+    """Field separator of a table file, judged by its header line."""
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            head = fh.readline()
+    except OSError:
+        return ","
+    best = max(",;\t|", key=head.count)
+    return best if head.count(best) else ","
+
+
 def _an_data(t: Task) -> None:
     files = [f for f in os.listdir(t.cwd) if f.lower().endswith((".csv", ".tsv", ".json", ".txt"))
              and f != "answer.txt"]
@@ -273,7 +286,7 @@ def _an_data(t: Task) -> None:
                 summ.append(f"{f}: {fh.read(600)}")
             continue
         with open(p, encoding="utf-8", errors="replace", newline="") as fh:
-            rows = list(csv.reader(fh, delimiter="\t" if f.endswith(".tsv") else ","))
+            rows = list(csv.reader(fh, delimiter=sniff_delimiter(p)))
         if not rows:
             summ.append(f"{f}: empty")
             t.p_feasible, t.why_infeasible = 0.05, f"{f} is empty"
@@ -335,22 +348,92 @@ def _an_coding(t: Task) -> None:
         t.certain = True
         return
     t.context["sources"] = "\n\n".join(f"### {k}\n{v}" for k, v in srcs.items())
+    libs = {k: v for k, v in srcs.items() if not (k.startswith("test") or k.endswith("_test.py"))}
     for k, v in srcs.items():
         if k.startswith("test") or k.endswith("_test.py"):
-            why = contradictory_asserts(v)
+            why, proven = contradictory_asserts(v, libs)
             if why:
                 t.p_feasible, t.why_infeasible = 0.05, f"{k}: {why}"
-                t.certain = True
+                t.certain = proven
 
 
-def contradictory_asserts(src: str) -> str:
-    """Same call asserted to give two different literal results -> tests can never all pass.
-    Also catches asserts on a function's __name__ that differ from the def name."""
+def _pure_functions(libs: Dict[str, str]) -> set:
+    """Top-level functions that read nothing but their own arguments, locals and
+    builtins: calling one twice with the same literals must give the same result."""
+    import ast
+    import builtins
+    pure = set()
+    for src in libs.values():
+        try:
+            tree = ast.parse(src)
+        except SyntaxError:
+            continue
+        for fn in tree.body:
+            if not isinstance(fn, ast.FunctionDef) or fn.decorator_list:
+                continue
+            a = fn.args
+            known = {x.arg for x in a.posonlyargs + a.args + a.kwonlyargs}
+            known |= {x.arg for x in (a.vararg, a.kwarg) if x}
+            if a.defaults or a.kw_defaults:
+                continue  # a mutable default can carry state between calls
+            ok = True
+            for n in ast.walk(fn):
+                if n is not fn and isinstance(n, (ast.Global, ast.Nonlocal, ast.Yield, ast.YieldFrom,
+                                                  ast.Import, ast.ImportFrom, ast.FunctionDef,
+                                                  ast.Lambda, ast.ClassDef)):
+                    ok = False
+                if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store):
+                    known.add(n.id)
+            for n in ast.walk(fn):
+                if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load) \
+                        and n.id not in known and not hasattr(builtins, n.id):
+                    ok = False
+                if isinstance(n, ast.Name) and n.id in ("open", "input", "print", "eval", "exec",
+                                                         "globals", "locals", "id", "hash", "iter", "next"):
+                    ok = False
+            if ok:
+                pure.add(fn.name)
+    return pure
+
+
+def contradictory_asserts(src: str, libs: Optional[Dict[str, str]] = None):
+    """Finds tests that can never all pass. Returns (reason, proven).
+
+    proven=True only for a pure library function called with the same literal arguments
+    and expected to return two different literals. Anything else that merely looks
+    contradictory (method calls on objects, which may be stateful; checks of __name__)
+    is reported with proven=False and gets a model attempt instead of being skipped."""
     import ast
     try:
         tree = ast.parse(src)
     except SyntaxError:
-        return ""
+        return "", False
+    pure = _pure_functions(libs or {})
+    modules = {os.path.splitext(k)[0] for k in (libs or {})}
+    aliases, direct = set(), set()
+    for n in ast.walk(tree):
+        if isinstance(n, ast.Import):
+            aliases |= {a.asname or a.name for a in n.names if a.name in modules}
+        elif isinstance(n, ast.ImportFrom) and n.module in modules:
+            direct |= {a.name for a in n.names if not a.asname}
+
+    def lib_func(call):
+        f = call.func
+        if isinstance(f, ast.Attribute) and isinstance(f.value, ast.Name) and f.value.id in aliases:
+            return f.attr
+        if isinstance(f, ast.Name) and f.id in direct:
+            return f.id
+        return None
+
+    def literal_args(call):
+        try:
+            for a in call.args:
+                ast.literal_eval(a)
+            return not call.keywords
+        except Exception:
+            return False
+
+    guess = ""
     seen = {}
     for node in ast.walk(tree):
         if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)):
@@ -370,11 +453,15 @@ def contradictory_asserts(src: str) -> str:
             continue
         if (isinstance(call, ast.Attribute) and call.attr == "__name__"
                 and isinstance(call.value, ast.Attribute) and call.value.attr != val):
-            return f"{ast.unparse(call)} must equal {val!r}"
-        if not isinstance(call, ast.Call):
+            guess = guess or f"{ast.unparse(call)} must equal {val!r}"
             continue
+        if not isinstance(call, ast.Call) or lib_func(call) is None:
+            continue  # methods of objects built in the test are stateful by nature
         key = ast.dump(call)
         if key in seen and seen[key] != val:
-            return f"{ast.unparse(call)} expected both {seen[key]!r} and {val!r}"
+            why = f"{ast.unparse(call)} expected both {seen[key]!r} and {val!r}"
+            if lib_func(call) in pure and literal_args(call):
+                return why, True
+            guess = guess or why
         seen.setdefault(key, val)
-    return ""
+    return guess, False

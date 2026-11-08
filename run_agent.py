@@ -32,6 +32,7 @@ def _writable_cwd():
 from harness.llm import LLM, Ledger, BudgetExhausted, ProxyDown  # noqa: E402
 from harness.log import log  # noqa: E402
 from harness.solvers import SOLVERS, Infeasible  # noqa: E402
+from harness.deterministic import det_solve  # noqa: E402
 from harness.tasks import load_tasks, analyze  # noqa: E402
 
 SKIP_BELOW = 0.1          # p_feasible under this -> do not spend tokens
@@ -131,6 +132,23 @@ async def main_async(args):
             t.deferred = True
             log(f"defer {t.id}: {t.why_infeasible}")
         todo.append(t)
+    # Phase 1, zero tokens: tasks the harness understands completely are solved by code.
+    # Whatever is left (unknown wording, ambiguous fix) goes to the model below.
+    det_sem = asyncio.Semaphore(4)
+
+    async def det_one(t):
+        async with det_sem:
+            ans = await asyncio.to_thread(det_solve, t)
+        ans = normalize_answer(t, (ans or "").strip())
+        if ans:
+            t.answer, t.status, t.det = ans, "answered", True
+            results.save(t, ans)
+
+    await asyncio.gather(*(det_one(t) for t in todo))
+    n_det = sum(t.det for t in todo)
+    log(f"phase 1: {n_det}/{len(todo)} solved without the model in {time.time() - t_start:.1f}s")
+    todo = [t for t in todo if not t.det]
+
     todo.sort(key=lambda t: (t.deferred, -t.priority))
     for t in todo:
         log(f"plan {t.id:22s} kind={t.kind:13s} r={t.reward:g} p={t.p_feasible:.2f} est={t.est_cost:.0f}")
@@ -185,7 +203,7 @@ async def main_async(args):
         f"in {time.time() - t_start:.0f}s")
     summary = [{"id": t.id, "kind": t.kind, "reward": t.reward, "status": t.status,
                 "answer": t.answer, "cost": round(t.spent, 1), "est": round(t.est_cost, 1),
-                "p_feasible": t.p_feasible, "why": t.why_infeasible} for t in tasks]
+                "p_feasible": t.p_feasible, "why": t.why_infeasible, "det": t.det} for t in tasks]
     try:
         with open(os.environ.get("SUMMARY_PATH", "/tmp/run_summary.json"), "w", encoding="utf-8") as f:
             json.dump({"spent": ledger.spent, "tasks": summary}, f, ensure_ascii=False, indent=1)
