@@ -98,12 +98,22 @@ async def main_async(args):
     results = Results(resolve_out(args.out, args.tasks_dir))
     log(f"budget={budget} out={results.path}")
 
-    todo = [t for t in tasks if t.p_feasible >= SKIP_BELOW and t.reward > 0]
+    # Proven infeasible -> never attempted. Only guessed infeasible -> attempted after
+    # everything else, with a single cheap call: a wrong guess on a feasible task would
+    # cost its reward (and in the 2-task qualifying run, the whole submission).
+    todo = []
     for t in tasks:
-        if t.p_feasible < SKIP_BELOW:
+        if t.reward <= 0:
+            continue
+        if t.p_feasible < SKIP_BELOW and t.certain:
             t.status = "skipped"
             log(f"skip {t.id}: {t.why_infeasible}")
-    todo.sort(key=lambda t: t.priority, reverse=True)
+            continue
+        if t.p_feasible < SKIP_BELOW:
+            t.deferred = True
+            log(f"defer {t.id}: {t.why_infeasible}")
+        todo.append(t)
+    todo.sort(key=lambda t: (t.deferred, -t.priority))
     for t in todo:
         log(f"plan {t.id:22s} kind={t.kind:13s} r={t.reward:g} p={t.p_feasible:.2f} est={t.est_cost:.0f}")
 

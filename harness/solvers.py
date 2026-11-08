@@ -46,7 +46,9 @@ def _mental_math(code: str) -> bool:
 async def _program(task: Task, llm: LLM, user: str, model: str, max_tokens: int = 400) -> str:
     msgs = [{"role": "system", "content": SYS_CODE}, {"role": "user", "content": user}]
     feedback = None
-    for attempt in range(2):
+    if task.deferred:  # probably infeasible: one short try only
+        max_tokens = min(max_tokens, 200)
+    for attempt in range(1 if task.deferred else 2):
         m = msgs if feedback is None else msgs + feedback
         reply = await llm.chat(m, model=model if attempt == 0 else MODELS["fast"],
                                max_tokens=max_tokens, tag=f"{task.id}#{attempt}")
@@ -55,7 +57,7 @@ async def _program(task: Task, llm: LLM, user: str, model: str, max_tokens: int 
             feedback = [{"role": "assistant", "content": reply},
                         {"role": "user", "content": "Reply with one ```python``` block only."}]
             continue
-        if task.kind == "math" and _mental_math(code) and attempt == 0:
+        if task.kind == "math" and _mental_math(code) and attempt == 0 and not task.deferred:
             # the model computed in its head (noreason models get arithmetic wrong)
             feedback = [{"role": "assistant", "content": f"```python\n{code}\n```"},
                         {"role": "user", "content": "Do not compute in your head. Write the steps "
@@ -74,7 +76,7 @@ async def _program(task: Task, llm: LLM, user: str, model: str, max_tokens: int 
         feedback = [{"role": "assistant", "content": f"```python\n{code}\n```"},
                     {"role": "user", "content": "It failed:\n" + clip(r.err or r.out or "no output", 800)
                      + "\nFix it. One ```python``` block only."}]
-    raise RuntimeError("program failed twice")
+    raise RuntimeError("program failed")
 
 
 # ------------------------------------------------------------------ math
@@ -98,7 +100,7 @@ def _conv(v):
         except (TypeError, ValueError):
             return v
 tables = {}
-for _f in sorted(_glob.glob('*.csv') + _glob.glob('*.tsv')):
+for _f in sorted(_glob.glob('**/*.csv', recursive=True) + _glob.glob('**/*.tsv', recursive=True)):
     with open(_f, newline='', encoding='utf-8', errors='replace') as _h:
         tables[_f] = [{k: _conv(v) for k, v in r.items()}
                       for r in _csv.DictReader(_h, delimiter='\t' if _f.endswith('.tsv') else ',')]
@@ -126,7 +128,7 @@ SYS_SEARCH = ("Answer the question using only the knowledge base. Facts may need
 
 async def solve_search(task: Task, llm: LLM) -> Optional[str]:
     contexts = [task.context.get("kb", "")]
-    if task.context.get("kb_wide"):
+    if task.context.get("kb_wide") and not task.deferred:
         contexts.append(task.context["kb_wide"])  # second try with more linked cards
     for i, kb in enumerate(contexts):
         user = f"Knowledge base:\n{kb}\n\nQuestion: {task.question}"
@@ -246,8 +248,8 @@ async def solve_coding(task: Task, llm: LLM) -> Optional[str]:
     base = (f"### {target}\n```python\n{original}\n```\n\n{test_src}\n\n"
             f"Test output:\n{clip(out, 1800)}")
     msgs = [{"role": "system", "content": SYS_FIX}, {"role": "user", "content": base}]
-    plan = [(MODELS["fast"], 700), (MODELS["fast"], 900)]
-    if os.environ.get("CODING_ESCALATE", "1") != "0":
+    plan = [(MODELS["fast"], 700)] + ([] if task.deferred else [(MODELS["fast"], 900)])
+    if os.environ.get("CODING_ESCALATE", "1") != "0" and not task.deferred:
         plan.append((MODELS["think"], 3000))
     current = original
     try:

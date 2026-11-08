@@ -22,6 +22,8 @@ class Task:
     answer_mode: str = "value"  # value | done
     p_feasible: float = 1.0
     why_infeasible: str = ""
+    certain: bool = False       # infeasibility proven, not guessed: never attempt
+    deferred: bool = False      # guessed infeasible: attempt last, once, if budget remains
     context: Dict[str, str] = field(default_factory=dict)
     est_cost: float = 0.0
     status: str = "todo"
@@ -118,6 +120,7 @@ def _an_math(t: Task) -> None:
         t.p_feasible, t.why_infeasible = 0.2, "no numbers in problem"
     if re.search(r"\b(?:into|by|among|between|over)\s+0\s+\w+", t.question):
         t.p_feasible, t.why_infeasible = 0.05, "division by zero in the statement"
+        t.certain = True
     first = re.split(r"(?<=[.!?])\s", t.question, maxsplit=1)[0]
     if not re.search(r"\d", first) and re.search(
             r"\b(unknown|unrecorded|unspecified|undisclosed|not recorded|some number|an? (?:certain|unknown) (?:number|amount))\b",
@@ -171,6 +174,7 @@ def _an_search(t: Task) -> None:
                     pass
     if not docs:
         t.p_feasible, t.why_infeasible = 0.05, "knowledge base is empty or missing"
+        t.certain = True
         return
     total = sum(len(v) for v in docs.values())
 
@@ -246,10 +250,20 @@ def _an_search(t: Task) -> None:
 def _an_data(t: Task) -> None:
     files = [f for f in os.listdir(t.cwd) if f.lower().endswith((".csv", ".tsv", ".json", ".txt"))
              and f != "answer.txt"]
-    mentioned = re.findall(r"\b([\w-]+\.(?:csv|tsv|json))\b", t.instruction)
-    for f in mentioned:
-        if not os.path.exists(os.path.join(t.cwd, f)):
+    mentioned = []
+    for f in dict.fromkeys(re.findall(r"([\w./-]*\w\.(?:csv|tsv|json))\b", t.instruction)):
+        if os.path.exists(os.path.join(t.cwd, f)):
+            mentioned.append(f)
+            continue
+        # maybe it sits in a subfolder (data/sales.csv): look through the whole task
+        base = os.path.basename(f)
+        hits = [os.path.relpath(os.path.join(dp, base), t.cwd)
+                for dp, _, fns in os.walk(t.dir) if base in fns]
+        if hits:
+            mentioned.append(hits[0])
+        else:
             t.p_feasible, t.why_infeasible = 0.05, f"{f} is missing"
+            t.certain = True
             return
     summ = []
     for f in (mentioned or files)[:4]:
@@ -263,6 +277,7 @@ def _an_data(t: Task) -> None:
         if not rows:
             summ.append(f"{f}: empty")
             t.p_feasible, t.why_infeasible = 0.05, f"{f} is empty"
+            t.certain = True
             continue
         head, body = rows[0], rows[1:]
         lines = [f"{f}: {len(body)} data rows, columns: {','.join(head)}",
@@ -317,6 +332,7 @@ def _an_coding(t: Task) -> None:
                 srcs[f] = fh.read()
     if not srcs:
         t.p_feasible, t.why_infeasible = 0.05, "no python sources"
+        t.certain = True
         return
     t.context["sources"] = "\n\n".join(f"### {k}\n{v}" for k, v in srcs.items())
     for k, v in srcs.items():
@@ -324,6 +340,7 @@ def _an_coding(t: Task) -> None:
             why = contradictory_asserts(v)
             if why:
                 t.p_feasible, t.why_infeasible = 0.05, f"{k}: {why}"
+                t.certain = True
 
 
 def contradictory_asserts(src: str) -> str:

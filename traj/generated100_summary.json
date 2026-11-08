@@ -1,5 +1,5 @@
 {
- "spent": 6182.5,
+ "spent": 6897.200000000003,
  "tasks": [
   {
    "id": "coding_0000",
@@ -18,7 +18,7 @@
    "reward": 4.0,
    "status": "answered",
    "answer": "DONE",
-   "cost": 194.2,
+   "cost": 194.5,
    "est": 427.1,
    "p_feasible": 1.0,
    "why": ""
@@ -29,7 +29,7 @@
    "reward": 3.0,
    "status": "answered",
    "answer": "DONE",
-   "cost": 90.0,
+   "cost": 90.1,
    "est": 426.4,
    "p_feasible": 1.0,
    "why": ""
@@ -40,7 +40,7 @@
    "reward": 3.0,
    "status": "answered",
    "answer": "DONE",
-   "cost": 149.5,
+   "cost": 149.7,
    "est": 430.1,
    "p_feasible": 1.0,
    "why": ""
@@ -51,7 +51,7 @@
    "reward": 2.0,
    "status": "answered",
    "answer": "DONE",
-   "cost": 103.4,
+   "cost": 103.5,
    "est": 436.3,
    "p_feasible": 1.0,
    "why": ""
@@ -62,7 +62,7 @@
    "reward": 2.0,
    "status": "answered",
    "answer": "DONE",
-   "cost": 184.9,
+   "cost": 185.2,
    "est": 436.2,
    "p_feasible": 1.0,
    "why": ""
@@ -73,7 +73,7 @@
    "reward": 5.0,
    "status": "answered",
    "answer": "DONE",
-   "cost": 147.2,
+   "cost": 147.4,
    "est": 432.1,
    "p_feasible": 1.0,
    "why": ""
@@ -84,7 +84,7 @@
    "reward": 2.0,
    "status": "answered",
    "answer": "DONE",
-   "cost": 165.6,
+   "cost": 165.8,
    "est": 422.5,
    "p_feasible": 1.0,
    "why": ""
@@ -95,7 +95,7 @@
    "reward": 3.0,
    "status": "answered",
    "answer": "DONE",
-   "cost": 108.6,
+   "cost": 108.7,
    "est": 439.9,
    "p_feasible": 1.0,
    "why": ""
@@ -106,7 +106,7 @@
    "reward": 2.0,
    "status": "answered",
    "answer": "DONE",
-   "cost": 154.9,
+   "cost": 155.1,
    "est": 437.8,
    "p_feasible": 1.0,
    "why": ""
@@ -117,7 +117,7 @@
    "reward": 4.0,
    "status": "answered",
    "answer": "DONE",
-   "cost": 136.8,
+   "cost": 137.0,
    "est": 437.5,
    "p_feasible": 1.0,
    "why": ""
@@ -128,7 +128,7 @@
    "reward": 2.0,
    "status": "answered",
    "answer": "DONE",
-   "cost": 206.7,
+   "cost": 206.8,
    "est": 428.7,
    "p_feasible": 1.0,
    "why": ""
@@ -139,7 +139,7 @@
    "reward": 4.0,
    "status": "answered",
    "answer": "DONE",
-   "cost": 77.2,
+   "cost": 77.3,
    "est": 421.6,
    "p_feasible": 1.0,
    "why": ""
@@ -150,7 +150,7 @@
    "reward": 2.0,
    "status": "answered",
    "answer": "DONE",
-   "cost": 168.1,
+   "cost": 168.4,
    "est": 431.1,
    "p_feasible": 1.0,
    "why": ""
@@ -161,7 +161,7 @@
    "reward": 3.0,
    "status": "answered",
    "answer": "DONE",
-   "cost": 90.9,
+   "cost": 91.0,
    "est": 427.3,
    "p_feasible": 1.0,
    "why": ""
@@ -172,7 +172,7 @@
    "reward": 4.0,
    "status": "answered",
    "answer": "DONE",
-   "cost": 91.7,
+   "cost": 91.8,
    "est": 438.8,
    "p_feasible": 1.0,
    "why": ""
@@ -183,7 +183,7 @@
    "reward": 2.0,
    "status": "answered",
    "answer": "DONE",
-   "cost": 117.6,
+   "cost": 117.8,
    "est": 434.7,
    "p_feasible": 1.0,
    "why": ""
@@ -194,7 +194,7 @@
    "reward": 4.0,
    "status": "answered",
    "answer": "DONE",
-   "cost": 206.2,
+   "cost": 206.5,
    "est": 423.3,
    "p_feasible": 1.0,
    "why": ""
@@ -205,7 +205,7 @@
    "reward": 5.0,
    "status": "answered",
    "answer": "DONE",
-   "cost": 101.7,
+   "cost": 101.8,
    "est": 440.2,
    "p_feasible": 1.0,
    "why": ""
@@ -227,7 +227,7 @@
    "reward": 3.0,
    "status": "answered",
    "answer": "DONE",
-   "cost": 190.7,
+   "cost": 190.8,
    "est": 433.0,
    "p_feasible": 1.0,
    "why": ""
@@ -238,7 +238,7 @@
    "reward": 3.0,
    "status": "answered",
    "answer": "DONE",
-   "cost": 134.6,
+   "cost": 134.8,
    "est": 436.0,
    "p_feasible": 1.0,
    "why": ""
@@ -249,7 +249,7 @@
    "reward": 5.0,
    "status": "answered",
    "answer": "DONE",
-   "cost": 98.6,
+   "cost": 98.7,
    "est": 424.9,
    "p_feasible": 1.0,
    "why": ""
@@ -282,7 +282,7 @@
    "reward": 2.0,
    "status": "answered",
    "answer": "1248",
-   "cost": 61.2,
+   "cost": 58.2,
    "est": 185.3,
    "p_feasible": 1.0,
    "why": ""
@@ -293,7 +293,7 @@
    "reward": 3.0,
    "status": "answered",
    "answer": "369",
-   "cost": 70.6,
+   "cost": 67.6,
    "est": 185.8,
    "p_feasible": 1.0,
    "why": ""
@@ -304,7 +304,7 @@
    "reward": 2.0,
    "status": "answered",
    "answer": "28",
-   "cost": 77.5,
+   "cost": 76.5,
    "est": 186.0,
    "p_feasible": 1.0,
    "why": ""
@@ -315,7 +315,7 @@
    "reward": 3.0,
    "status": "answered",
    "answer": "302768",
-   "cost": 58.7,
+   "cost": 61.7,
    "est": 185.4,
    "p_feasible": 1.0,
    "why": ""
@@ -348,7 +348,7 @@
    "reward": 4.0,
    "status": "answered",
    "answer": "51",
-   "cost": 77.0,
+   "cost": 75.0,
    "est": 186.1,
    "p_feasible": 1.0,
    "why": ""
@@ -357,9 +357,9 @@
    "id": "data_analysis_0038",
    "kind": "data_analysis",
    "reward": 2.0,
-   "status": "skipped",
+   "status": "error: RuntimeError: program failed",
    "answer": null,
-   "cost": 0.0,
+   "cost": 43.7,
    "est": 185.9,
    "p_feasible": 0.05,
    "why": "column 'discount' not in sales.csv"
@@ -381,7 +381,7 @@
    "reward": 1.0,
    "status": "answered",
    "answer": "5581",
-   "cost": 71.3,
+   "cost": 68.3,
    "est": 186.0,
    "p_feasible": 1.0,
    "why": ""
@@ -423,9 +423,9 @@
    "id": "data_analysis_0069",
    "kind": "data_analysis",
    "reward": 3.0,
-   "status": "skipped",
+   "status": "error: RuntimeError: program failed",
    "answer": null,
-   "cost": 0.0,
+   "cost": 43.5,
    "est": 185.8,
    "p_feasible": 0.05,
    "why": "column 'discount' not in sales.csv"
@@ -434,9 +434,9 @@
    "id": "data_analysis_0071",
    "kind": "data_analysis",
    "reward": 3.0,
-   "status": "skipped",
+   "status": "error: RuntimeError: program failed",
    "answer": null,
-   "cost": 0.0,
+   "cost": 43.5,
    "est": 185.8,
    "p_feasible": 0.05,
    "why": "column 'discount' not in sales.csv"
@@ -445,9 +445,9 @@
    "id": "data_analysis_0074",
    "kind": "data_analysis",
    "reward": 1.0,
-   "status": "skipped",
-   "answer": null,
-   "cost": 0.0,
+   "status": "answered",
+   "answer": "0",
+   "cost": 72.9,
    "est": 185.9,
    "p_feasible": 0.08,
    "why": "value 'gizmo-pro' not present in sales.csv"
@@ -502,7 +502,7 @@
    "reward": 3.0,
    "status": "answered",
    "answer": "16975",
-   "cost": 61.1,
+   "cost": 58.1,
    "est": 185.2,
    "p_feasible": 1.0,
    "why": ""
@@ -524,7 +524,7 @@
    "reward": 3.0,
    "status": "answered",
    "answer": "330013",
-   "cost": 58.7,
+   "cost": 61.7,
    "est": 185.5,
    "p_feasible": 1.0,
    "why": ""
@@ -557,7 +557,7 @@
    "reward": 3.0,
    "status": "answered",
    "answer": "34",
-   "cost": 79.5,
+   "cost": 91.5,
    "est": 186.0,
    "p_feasible": 1.0,
    "why": ""
@@ -612,7 +612,7 @@
    "reward": 3.0,
    "status": "answered",
    "answer": "2461",
-   "cost": 43.6,
+   "cost": 48.6,
    "est": 143.3,
    "p_feasible": 1.0,
    "why": ""
@@ -643,9 +643,9 @@
    "id": "math_0017",
    "kind": "math",
    "reward": 1.0,
-   "status": "skipped",
-   "answer": null,
-   "cost": 0.0,
+   "status": "answered",
+   "answer": "63",
+   "cost": 54.9,
    "est": 144.6,
    "p_feasible": 0.05,
    "why": "starting quantity is not given"
@@ -676,9 +676,9 @@
    "id": "math_0026",
    "kind": "math",
    "reward": 5.0,
-   "status": "skipped",
-   "answer": null,
-   "cost": 0.0,
+   "status": "answered",
+   "answer": "-13",
+   "cost": 31.1,
    "est": 141.9,
    "p_feasible": 0.05,
    "why": "starting quantity is not given"
@@ -720,9 +720,9 @@
    "id": "math_0041",
    "kind": "math",
    "reward": 1.0,
-   "status": "skipped",
+   "status": "infeasible: model says impossible",
    "answer": null,
-   "cost": 0.0,
+   "cost": 29.6,
    "est": 147.7,
    "p_feasible": 0.05,
    "why": "starting quantity is not given"
@@ -755,7 +755,7 @@
    "reward": 1.0,
    "status": "answered",
    "answer": "914",
-   "cost": 90.3,
+   "cost": 81.3,
    "est": 143.4,
    "p_feasible": 1.0,
    "why": ""
@@ -786,9 +786,9 @@
    "id": "math_0061",
    "kind": "math",
    "reward": 3.0,
-   "status": "skipped",
+   "status": "infeasible: model says impossible",
    "answer": null,
-   "cost": 0.0,
+   "cost": 26.5,
    "est": 143.6,
    "p_feasible": 0.05,
    "why": "starting quantity is not given"
@@ -797,9 +797,9 @@
    "id": "math_0066",
    "kind": "math",
    "reward": 4.0,
-   "status": "skipped",
+   "status": "error: RuntimeError: program failed",
    "answer": null,
-   "cost": 0.0,
+   "cost": 214.8,
    "est": 146.1,
    "p_feasible": 0.05,
    "why": "starting quantity is not given"
@@ -832,7 +832,7 @@
    "reward": 4.0,
    "status": "answered",
    "answer": "1188",
-   "cost": 67.2,
+   "cost": 64.2,
    "est": 148.3,
    "p_feasible": 1.0,
    "why": ""
@@ -843,7 +843,7 @@
    "reward": 2.0,
    "status": "answered",
    "answer": "195",
-   "cost": 65.9,
+   "cost": 63.9,
    "est": 144.9,
    "p_feasible": 1.0,
    "why": ""
@@ -863,9 +863,9 @@
    "id": "math_0096",
    "kind": "math",
    "reward": 3.0,
-   "status": "skipped",
+   "status": "infeasible: model says impossible",
    "answer": null,
-   "cost": 0.0,
+   "cost": 27.0,
    "est": 144.6,
    "p_feasible": 0.05,
    "why": "starting quantity is not given"
@@ -1028,9 +1028,9 @@
    "id": "search_0058",
    "kind": "search",
    "reward": 5.0,
-   "status": "skipped",
+   "status": "infeasible: not in KB",
    "answer": null,
-   "cost": 0.0,
+   "cost": 129.6,
    "est": 115.3,
    "p_feasible": 0.05,
    "why": "entities ['olga novak'] not in KB"
