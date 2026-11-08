@@ -138,8 +138,27 @@ async def solve_search(task: Task, llm: LLM) -> Optional[str]:
         ans = reply.strip().splitlines()[0].strip() if reply.strip() else ""
         ans = re.sub(r"^(answer|final answer)\s*[:\-]\s*", "", ans, flags=re.I).strip().strip("*`'\". ")
         if ans and not ans.upper().startswith(IMPOSSIBLE) and ans.lower() not in ("unknown", "none", "n/a"):
-            return ans
+            return kb_spelling(ans, kb)
     raise Infeasible("not in KB")
+
+
+def kb_spelling(ans: str, kb: str) -> str:
+    """The check is an exact string match, so return the value as the KB spells it:
+    'osaka' -> 'Osaka', 'The city is Osaka' -> 'Osaka'. Unknown values pass through."""
+    values = {}
+    for line in kb.splitlines():
+        m = re.match(r"^(?:#\s*|[\w ]+:\s*)(.+?)\s*$", line)
+        if m and not line.startswith("---"):
+            values.setdefault(m.group(1).lower(), m.group(1))
+    if ans.lower() in values:
+        return values[ans.lower()]
+    inside = [v for k, v in values.items()
+              if re.search(r"(?<!\w)" + re.escape(k) + r"(?!\w)", ans.lower())]
+    longest = max(inside, key=len, default=None)
+    # a sentence around exactly one KB value (shorter hits inside it do not count)
+    if longest and all(v.lower() in longest.lower() for v in inside) and len(ans.split()) > len(longest.split()):
+        return longest
+    return ans
 
 
 # ------------------------------------------------------------------ coding

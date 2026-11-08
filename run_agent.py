@@ -7,6 +7,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import re
 import os
 import sys
 import time
@@ -52,6 +53,23 @@ class Results:
         _atomic_write(self.path, json.dumps(self.data, ensure_ascii=False, indent=1))
         for d in {task.dir, task.cwd}:
             _atomic_write(os.path.join(d, "answer.txt"), answer + "\n")
+
+
+def normalize_answer(task, ans: str) -> str:
+    """Shape the answer for the checker named in task.json ("check"): exact_int wants a
+    bare integer, so '1,735', '389.0' and '389 boxes' become '1735', '389', '389'."""
+    check = str(task.raw.get("check", "")).lower()
+    if check == "unittest" or task.answer_mode == "done":
+        return ans
+    if check == "exact_int" or (not check and task.kind in ("math", "data_analysis")):
+        s = ans.strip().strip("'\"`")
+        s = re.sub(r"(?<=\d)[,_  ](?=\d{3}\b)", "", s)   # thousands separators
+        if re.fullmatch(r"[-+]?\d+(\.0+)?", s):
+            return str(int(s.split(".")[0]))
+        nums = re.findall(r"(?<![\w.])[-+]?\d+(?:\.\d+)?(?![\w.])", s)
+        if check == "exact_int" and len(nums) == 1 and re.fullmatch(r"[-+]?\d+(\.0+)?", nums[0]):
+            return str(int(nums[0].split(".")[0]))                   # '389 boxes'
+    return ans
 
 
 def _atomic_write(path: str, text: str):
@@ -141,7 +159,7 @@ async def main_async(args):
             t0 = time.time()
             try:
                 ans = await asyncio.wait_for(SOLVERS[t.kind](t, llm), timeout=600)
-                ans = (ans or "").strip()
+                ans = normalize_answer(t, (ans or "").strip())
                 if ans:
                     t.answer, t.status = ans, "answered"
                     results.save(t, ans)
