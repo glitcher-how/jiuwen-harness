@@ -17,8 +17,8 @@ from typing import List, Optional
 from .log import log, traj, quiet_framework_logs
 
 MODELS = {
-    "fast": "qwen3.8-27b-noreason",
-    "think": "qwen3.8-27b",
+    "fast": os.environ.get("FAST_MODEL", "qwen3.8-27b-noreason"),
+    "think": os.environ.get("THINK_MODEL", "qwen3.8-27b"),
     "moe_fast": "qwen3.6-35b-a3b-noreason",
     "moe_think": "qwen3.6-35b-a3b",
 }

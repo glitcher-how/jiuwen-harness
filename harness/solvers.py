@@ -37,6 +37,12 @@ def _num_clean(ans: str) -> str:
     return a
 
 
+def _mental_math(code: str) -> bool:
+    """True if the 'program' just prints a precomputed literal, e.g. print(9352)."""
+    body = [ln.strip() for ln in code.splitlines() if ln.strip() and not ln.strip().startswith("#")]
+    return len(body) == 1 and bool(re.fullmatch(r"print\(\s*-?[\d.]+\s*\)", body[0]))
+
+
 async def _program(task: Task, llm: LLM, user: str, model: str, max_tokens: int = 400) -> str:
     msgs = [{"role": "system", "content": SYS_CODE}, {"role": "user", "content": user}]
     feedback = None
@@ -48,6 +54,12 @@ async def _program(task: Task, llm: LLM, user: str, model: str, max_tokens: int 
         if not code:
             feedback = [{"role": "assistant", "content": reply},
                         {"role": "user", "content": "Reply with one ```python``` block only."}]
+            continue
+        if task.kind == "math" and _mental_math(code) and attempt == 0:
+            # the model computed in its head (noreason models get arithmetic wrong)
+            feedback = [{"role": "assistant", "content": f"```python\n{code}\n```"},
+                        {"role": "user", "content": "Do not compute in your head. Write the steps "
+                         "as Python statements starting from the numbers in the problem."}]
             continue
         r = run_python(PRELUDE.get(task.kind, "") + code, task.cwd, timeout=30)
         ans = _answer_line(r.out) if r.ok else None
@@ -113,15 +125,19 @@ SYS_SEARCH = ("Answer the question using only the knowledge base. Facts may need
 
 
 async def solve_search(task: Task, llm: LLM) -> Optional[str]:
-    user = f"Knowledge base:\n{task.context.get('kb', '')}\n\nQuestion: {task.question}"
-    reply = await llm.chat([{"role": "system", "content": SYS_SEARCH},
-                            {"role": "user", "content": user}],
-                           model=MODELS["fast"], max_tokens=24, tag=task.id)
-    ans = reply.strip().splitlines()[0].strip() if reply.strip() else ""
-    ans = re.sub(r"^(answer|final answer)\s*[:\-]\s*", "", ans, flags=re.I).strip().strip("*`'\". ")
-    if not ans or ans.upper().startswith(IMPOSSIBLE) or ans.lower() in ("unknown", "none", "n/a"):
-        raise Infeasible("not in KB")
-    return ans
+    contexts = [task.context.get("kb", "")]
+    if task.context.get("kb_wide"):
+        contexts.append(task.context["kb_wide"])  # second try with more linked cards
+    for i, kb in enumerate(contexts):
+        user = f"Knowledge base:\n{kb}\n\nQuestion: {task.question}"
+        reply = await llm.chat([{"role": "system", "content": SYS_SEARCH},
+                                {"role": "user", "content": user}],
+                               model=MODELS["fast"], max_tokens=24, tag=f"{task.id}#{i}")
+        ans = reply.strip().splitlines()[0].strip() if reply.strip() else ""
+        ans = re.sub(r"^(answer|final answer)\s*[:\-]\s*", "", ans, flags=re.I).strip().strip("*`'\". ")
+        if ans and not ans.upper().startswith(IMPOSSIBLE) and ans.lower() not in ("unknown", "none", "n/a"):
+            return ans
+    raise Infeasible("not in KB")
 
 
 # ------------------------------------------------------------------ coding
@@ -230,7 +246,9 @@ async def solve_coding(task: Task, llm: LLM) -> Optional[str]:
     base = (f"### {target}\n```python\n{original}\n```\n\n{test_src}\n\n"
             f"Test output:\n{clip(out, 1800)}")
     msgs = [{"role": "system", "content": SYS_FIX}, {"role": "user", "content": base}]
-    plan = [(MODELS["fast"], 700), (MODELS["fast"], 900), (MODELS["think"], 3000)]
+    plan = [(MODELS["fast"], 700), (MODELS["fast"], 900)]
+    if os.environ.get("CODING_ESCALATE", "1") != "0":
+        plan.append((MODELS["think"], 3000))
     current = original
     try:
         for i, (model, mt) in enumerate(plan):

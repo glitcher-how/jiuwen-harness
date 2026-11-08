@@ -38,8 +38,11 @@ def gen_math(rng, feasible):
     parts = [f"A warehouse starts with {n} boxes."]
     for _ in range(rng.randint(2, 5)):
         op = rng.choice(["ship", "recv", "split", "double", "lose", "sell_half_up"])
+        if op == "ship" and x < 400:  # keep the stock positive: negative floor division is ambiguous
+            op = "recv"
         if op == "ship":
             a, d = rng.randint(5, 60), rng.randint(2, 6)
+            a = min(a, max(1, (x - 50) // d))
             x -= a * d
             parts.append(f"It ships {a} boxes per day for {d} days.")
         elif op == "recv":
@@ -230,11 +233,12 @@ def main():
     ap.add_argument("--n", type=int, default=100)
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--infeasible", type=float, default=0.2)
+    ap.add_argument("--balanced", action="store_true", help="equal number of tasks per kind")
     a = ap.parse_args()
     rng = random.Random(a.seed)
     kinds = sorted(GENS)
     for i in range(a.n):
-        kind = kinds[i % 4] if i < 8 else rng.choice(kinds)
+        kind = kinds[i % 4] if (i < 8 or a.balanced) else rng.choice(kinds)
         feasible = rng.random() >= a.infeasible
         instr, (check, expected), files = GENS[kind](rng, feasible)
         tid = f"{kind}_{i:04d}"

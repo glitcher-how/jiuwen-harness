@@ -195,38 +195,50 @@ def _an_search(t: Task) -> None:
         if names and not hits:
             t.p_feasible, t.why_infeasible = 0.05, f"entities {sorted(names)} not in KB"
         seeds = hits
-    picked: List[str] = []
-    frontier = list(dict.fromkeys(seeds))
-    # how many links the question walks: X -> mentor -> employer -> company facts
+    def walk(max_hops: int) -> List[str]:
+        picked: List[str] = []
+        frontier = list(dict.fromkeys(seeds))
+        for _hop in range(max_hops):
+            nxt = []
+            for p in frontier:
+                if p in picked:
+                    continue
+                picked.append(p)
+                refs = _FIELD.findall(docs[p]) + _NAME.findall(docs[p])
+                for v in refs:
+                    for n in [v] + re.split(r"\s*(?:,|;|\band\b)\s*", v):
+                        for q in by_title.get(_norm(n), []):
+                            if q not in picked:
+                                nxt.append(q)
+            frontier = nxt
+            if not frontier:
+                break
+        return picked
+
+    # Cards the question needs: the person, one per person->person link
+    # ("mentor of the mentor" counts twice), and one more if a fact about the
+    # company is asked (the employer's name itself is on the person's card).
+    # Extra cards are not free: the model sometimes walks one link too far.
     ql = t.question.lower()
-    rel = sum(bool(re.search(p, ql)) for p in (
-        r"mentor|manager|supervisor|advisor|spouse|friend|colleague|parent",
-        r"employ|work(s|ed)? (for|at)|company|organi[sz]ation|firm",
-        r"headquarter|founded|located|city|ceo|founder|industry"))
-    max_hops = 1 + rel
-    for _hop in range(max_hops):
-        nxt = []
-        for p in frontier:
-            if p in picked:
-                continue
-            picked.append(p)
-            refs = _FIELD.findall(docs[p]) + _NAME.findall(docs[p])
-            for v in refs:
-                for n in [v] + re.split(r"\s*(?:,|;|\band\b)\s*", v):
-                    for q in by_title.get(_norm(n), []):
-                        if q not in picked:
-                            nxt.append(q)
-        frontier = nxt
-        if not frontier:
-            break
-    if picked:
-        chosen = picked[:25]          # only the entity-linked cards
-    elif total <= 6000:
-        chosen = list(docs)           # nothing matched: small KB goes in whole
-    else:
-        chosen = list(docs)[:25]
-    t.context["kb"] = "\n".join(f"--- {p}\n{docs[p].strip()}" for p in chosen)
-    t.context["kb_linked"] = ", ".join(picked)
+    person_links = len(re.findall(
+        r"\b(mentor|manager|supervisor|advisor|spouse|friend|colleague|parent|boss)s?\b", ql))
+    company_fact = bool(re.search(r"headquarter|founded|located|\bcity\b|\bceo\b|founder|industry", ql))
+    need = 1 + person_links + int(company_fact)
+
+    def render(paths):
+        if paths:
+            chosen = paths[:25]           # only the entity-linked cards
+        elif total <= 6000:
+            chosen = list(docs)           # nothing matched: small KB goes in whole
+        else:
+            chosen = list(docs)[:25]
+        return "\n".join(f"--- {p}\n{docs[p].strip()}" for p in chosen)
+
+    narrow, wide = walk(need), walk(need + 2)
+    t.context["kb"] = render(narrow)
+    if wide != narrow:
+        t.context["kb_wide"] = render(wide)  # retry context if the narrow one is not enough
+    t.context["kb_linked"] = ", ".join(narrow)
 
 
 # --- data analysis: schema summary instead of raw file
