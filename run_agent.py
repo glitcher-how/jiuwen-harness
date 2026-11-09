@@ -62,6 +62,11 @@ def normalize_answer(task, ans: str) -> str:
     check = str(task.raw.get("check", "")).lower()
     if check == "unittest" or task.answer_mode == "done":
         return ans
+    # A placeholder copied from the data is not an answer: the value is missing, so the
+    # task is infeasible and no answer file must be written.
+    if re.fullmatch(r"(redacted|unknown|n/?a|none|null|tbd|not (recorded|available|included|specified)"
+                    r"|missing|impossible|\?+|-+)\.?", ans.strip().strip("'\"`[]()<>").lower()):
+        return ""
     if check == "exact_int" or (not check and task.kind in ("math", "data_analysis")):
         s = ans.strip().strip("'\"`")
         s = re.sub(r"(?<=\d)[,_  ](?=\d{3}\b)", "", s)   # thousands separators
@@ -181,6 +186,8 @@ async def main_async(args):
                 if ans:
                     t.answer, t.status = ans, "answered"
                     results.save(t, ans)
+                else:
+                    t.status = "infeasible: no usable answer"
             except Infeasible as e:
                 t.status = f"infeasible: {e}"
             except (BudgetExhausted, ProxyDown) as e:
