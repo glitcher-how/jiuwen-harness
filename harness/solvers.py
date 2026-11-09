@@ -16,7 +16,8 @@ from .tasks import Task
 IMPOSSIBLE = "IMPOSSIBLE"
 
 SYS_CODE = ("You write minimal Python 3 programs. Reply with exactly one ```python``` code block "
-            "and nothing else, no comments. The program must print only the final answer (one line). "
+            "and nothing else, no comments. The program must print only the final answer (one line) "
+            "and must not write files. "
             f"If the problem is contradictory or cannot be answered from the given data, "
             f"print {IMPOSSIBLE}.")
 
@@ -150,14 +151,17 @@ async def solve_data(task: Task, llm: LLM) -> Optional[str]:
            + ". Write the shortest code that prints the answer; do not reread files.")
     user = (f"Files in the working directory (summary):\n{task.context.get('data', '')}{note}\n\n"
             f"Task: {task.question}\n{pre}")
-    return await _program(task, llm, user, MODELS["fast"], max_tokens=300)
+    return await _program(task, llm, user + " If a value the answer depends on is blank or "
+                          f"missing, print {IMPOSSIBLE}.", MODELS["fast"], max_tokens=300)
 
 
 # ------------------------------------------------------------------ search
 
 SYS_SEARCH = ("Answer the question using only the knowledge base. Facts may need several hops "
               "(person -> employer -> company facts). Reply with only the answer value, exactly as "
-              f"written in the KB, no sentence. If the KB does not contain it, reply {IMPOSSIBLE}.")
+              "written in the KB, no sentence. Apply every condition of the question (day, role, "
+              "earliest/latest) before choosing. If the KB does not contain the answer or does not "
+              f"single out one value, reply {IMPOSSIBLE}.")
 
 
 async def solve_search(task: Task, llm: LLM) -> Optional[str]:
@@ -165,11 +169,15 @@ async def solve_search(task: Task, llm: LLM) -> Optional[str]:
     # unfamiliar wording, where the hop estimate behind the narrow context cannot be
     # trusted, so the model gets the wider set of linked cards straight away.
     contexts = [task.context.get("kb_wide") or task.context.get("kb", "")]
+    # The model without reasoning answers lookups well but picks the wrong card when the
+    # question needs filtering or comparing, and guesses when the KB is silent. Unfamiliar
+    # questions therefore go to the reasoning model; a probably-infeasible one stays cheap.
+    model, limit = (MODELS["fast"], 24) if task.deferred else (MODELS["think"], 1200)
     for i, kb in enumerate(contexts):
         user = f"Knowledge base:\n{kb}\n\nQuestion: {task.question}"
         reply = await llm.chat([{"role": "system", "content": SYS_SEARCH},
                                 {"role": "user", "content": user}],
-                               model=MODELS["fast"], max_tokens=24, tag=f"{task.id}#{i}")
+                               model=model, max_tokens=limit, tag=f"{task.id}#{i}")
         ans = reply.strip().splitlines()[0].strip() if reply.strip() else ""
         ans = re.sub(r"^(answer|final answer)\s*[:\-]\s*", "", ans, flags=re.I).strip().strip("*`'\". ")
         if ans and not ans.upper().startswith(IMPOSSIBLE) and ans.lower() not in ("unknown", "none", "n/a"):
@@ -203,7 +211,8 @@ SYS_FIX = ("You fix bugs in Python code. Hidden tests check other inputs too, so
            "Reply with exactly one ```python``` block that contains ONLY the top-level functions/classes "
            "you changed (complete definitions, plus any imports they need); omit unchanged ones. "
            "Do not touch tests. "
-           f"If the tests contradict each other and cannot all pass, reply {IMPOSSIBLE}.")
+           "Never create or edit data files. If the tests cannot pass by editing this code alone "
+           f"(they contradict each other, or need a file that is missing), reply {IMPOSSIBLE}.")
 
 
 def _sha(path: str) -> str:
@@ -336,6 +345,12 @@ def _compact(target: str, src: str, cwd: str, tests, out: str) -> Optional[str]:
             + "\n\n" + "\n".join(errors))
 
 
+def _fail_signature(out: str):
+    """Which tests fail and with what error, ignoring line numbers and timings."""
+    return tuple(sorted(set(re.findall(
+        r"^(?:FAIL|ERROR): \w+|^\w*(?:Error|Exception)\b.*$", out, re.M))))
+
+
 def _coding_prompt(target: str, src: str, cwd: str, tests, out: str) -> str:
     short = _compact(target, src, cwd, tests, out)
     if short:
@@ -372,7 +387,12 @@ async def solve_coding(task: Task, llm: LLM) -> Optional[str]:
         plan.append((MODELS["think"], 3000))
     current = original
     try:
+        sig0 = _fail_signature(out)
         for i, (model, mt) in enumerate(plan):
+            if model == MODELS["think"] and _fail_signature(out) == sig0:
+                # two patches changed nothing about how the tests fail: the cause is not
+                # in this file, and the expensive model would only burn budget on it
+                raise Infeasible("patches do not change the failure")
             reply = await llm.chat(msgs, model=model, max_tokens=mt, tag=f"{task.id}#{i}")
             if IMPOSSIBLE in reply and "```" not in reply:
                 raise Infeasible("model says tests contradict")

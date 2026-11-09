@@ -55,7 +55,17 @@ def clean_instruction(text: str) -> str:
     q = text
     for pat in _BOILER:
         q = re.sub(pat, "", q, flags=re.I)
-    return re.sub(r"\s+", " ", q).strip()
+    # Any other wording of the same housekeeping: how to deliver the answer, which tools
+    # to use. The harness does both itself, and the model must not act on them.
+    keep = []
+    for sent in re.split(r"(?<=[.?!])\s+(?=[A-Z`])", q):
+        if "answer.txt" in sent:
+            continue
+        if re.match(r"(Use|Compute it with|Work only)\b", sent) and re.search(
+                r"\bbash\b|python3|file tools|current directory", sent):
+            continue
+        keep.append(sent)
+    return re.sub(r"\s+", " ", " ".join(keep)).strip()
 
 
 def load_tasks(root: str) -> List[Task]:
@@ -303,7 +313,9 @@ def _an_data(t: Task) -> None:
             if numeric:
                 nums = [float(v) for v in col_vals if v]
                 if nums:
-                    lines.append(f"{col}: numeric {min(nums):g}..{max(nums):g}")
+                    blank = sum(1 for v in col_vals if not v.strip())
+                    lines.append(f"{col}: numeric {min(nums):g}..{max(nums):g}"
+                                 + (f", {blank} BLANK (value missing)" if blank else ""))
             elif len(uniq) <= 25:
                 lines.append(f"{col}: values {uniq}")
                 values[col] = set(uniq)
@@ -348,6 +360,14 @@ def _an_coding(t: Task) -> None:
         t.certain = True
         return
     t.context["sources"] = "\n\n".join(f"### {k}\n{v}" for k, v in srcs.items())
+    # A test that reads a data file which is not there usually cannot be satisfied by
+    # editing the library. Not proof (the fix may be to stop needing it), so: one try.
+    for k, v in srcs.items():
+        if k.startswith("test") or k.endswith("_test.py"):
+            for name in re.findall(r"""['"]([\w./-]+\.(?:json|csv|tsv|txt|ya?ml|dat|ini))['"]""", v):
+                if name != "answer.txt" and not any(
+                        os.path.basename(name) in fns for _, _, fns in os.walk(t.dir)):
+                    t.p_feasible, t.why_infeasible = 0.05, f"{k} needs {name}, which is missing"
     libs = {k: v for k, v in srcs.items() if not (k.startswith("test") or k.endswith("_test.py"))}
     for k, v in srcs.items():
         if k.startswith("test") or k.endswith("_test.py"):
