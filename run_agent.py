@@ -276,7 +276,7 @@ async def main_async(args):
                 need = costs[t.id]
                 used = ledger.spent - start_spent
                 # typical review costs about a third of its worst case
-                fits = ledger.remaining() - held[0] >= need and used + held[0] / 3 < allowance
+                fits = ledger.remaining() - held[0] >= need and used + (held[0] + need) / 3 <= allowance
                 if ledger.dead or left < 60 or not fits:
                     continue
                 held[0] += need

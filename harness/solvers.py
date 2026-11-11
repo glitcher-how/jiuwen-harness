@@ -120,7 +120,7 @@ async def _program(task: Task, llm: LLM, user: str, model: str, max_tokens: int 
         # a reply cut off inside the code block is half a program: whatever it printed
         # is not the answer, even if it ran
         cut = reply.truncated and reply.content.count("```") % 2 == 1
-        if ans and not (cut and regrown < 2 and not task.deferred):
+        if ans and not cut:
             return _num_clean(ans)
         if r is None and IMPOSSIBLE in reply.content.upper():
             raise Infeasible("model says impossible")
@@ -223,13 +223,23 @@ for _f in sorted(_glob.glob('**/*.csv', recursive=True) + _glob.glob('**/*.tsv',
         _delim = _delim if _head.count(_delim) else ','
         tables[_f] = [{k: _conv(v) for k, v in r.items()}
                       for r in _csv.DictReader(_h, delimiter=_delim)]
-rows = next(iter(tables.values())) if len(tables) == 1 else None
+for _f in sorted(_glob.glob('**/*.json', recursive=True)):
+    try:
+        import json as _json
+        with open(_f, encoding='utf-8') as _h:
+            _d = _json.load(_h)
+        if isinstance(_d, list) and _d and all(isinstance(_r, dict) for _r in _d):
+            tables[_f] = _d
+    except Exception:
+        pass
+rows = next(iter(tables.values())) if len(tables) == 1 and not _glob.glob('**/*.json', recursive=True) else None
 '''}
 
 
 async def solve_data(task: Task, llm: LLM) -> Optional[str]:
     note = f"\nNote: {task.context['note']}" if task.context.get("note") else ""
-    one = task.context.get("data", "").count("data rows") == 1
+    found = [f for _, _, fs in os.walk(task.cwd) for f in fs if f.lower().endswith((".csv", ".tsv", ".json"))]
+    one = len(found) == 1 and not found[0].lower().endswith(".json")  # same rule as `rows` in PRELUDE
     pre = ("Preloaded variables: `tables` = {filename: list of row dicts}, plain numbers already int/float "
            "(codes like 007 stay strings)"
            + ("; `rows` = rows of the only table" if one else "")

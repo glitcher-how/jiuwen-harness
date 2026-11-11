@@ -65,7 +65,8 @@ def _housekeeping(sent: str) -> bool:
     change the task, so a single unknown word is enough to keep the sentence."""
     if not _TRIGGER.search(sent):
         return False
-    words = re.findall(r"[A-Za-z0-9_']+", re.sub(r"`?[\w./-]+\.(?:py|txt)\b`?", " ", sent.lower()))
+    words = re.findall(r"[A-Za-z0-9_']+", re.sub(r"`?(?:[\w./-]*/)?(?:test_\w+\.py|answer\.txt)\b`?", " ",
+                                                 sent.lower()))
     return all(w in _FILLER for w in words)
 
 
@@ -170,7 +171,7 @@ def _an_math(t: Task) -> None:
     # The zero must belong to the division itself: the first "into/by/among" after the
     # verb. "Divide 10 by 2 and increase the result by 0" is an ordinary problem. Even so
     # this is a guess from the wording, so the task is postponed, not dropped.
-    if re.search(r"\b(?:split|divided?|shared?|distributed?)\b"
+    if re.search(r"(?<!\bnot )(?<!\bnever )(?<!\bn't )\b(?:split|divided?|shared?|distributed?)\b"
                  r"(?:(?!\b(?:into|by|among|between)\b)[^.?!])*"
                  r"\b(?:into|by|among|between)\s+0\b(?![.,]?\d)", t.question, re.I):
         t.p_feasible, t.why_infeasible = 0.05, "division by zero in the statement"
@@ -207,6 +208,10 @@ _FIELD = re.compile(r"^[\w ]+:\s*(.+?)\s*$", re.M)
 
 def _norm(s: str) -> str:
     return re.sub(r"[^a-z0-9]+", " ", s.lower()).strip()
+
+
+_LEAD_WORDS = set("""find give return report tell name list determine identify locate search look read use open
+what which who whose where when in for from of the is was does did how""".split())
 
 
 def _an_search(t: Task) -> None:
@@ -259,6 +264,9 @@ def _an_search(t: Task) -> None:
     for n in list(names):
         w = n.split()
         names.update(" ".join(w[i:]) for i in range(1, len(w) - 1))
+        if len(w) == 2 and w[0] in _LEAD_WORDS:
+            names.discard(n)        # "Find Alice": the name is "Alice"
+            names.add(w[1])
     seeds = [p for n in names for p in by_title.get(n, [])]
     if not seeds:
         # unknown entity -> very likely an infeasible question; still try body search
@@ -417,9 +425,11 @@ def _an_coding(t: Task) -> None:
             with open(os.path.join(t.cwd, f), encoding="utf-8", errors="replace") as fh:
                 srcs[f] = fh.read()
     if not srcs:
-        t.p_feasible, t.why_infeasible = 0.05, "no python sources"
-        t.certain = True
-        return
+        nested = any(f.endswith(".py") for _, _, fs in os.walk(t.cwd) for f in fs)
+        if not nested:
+            t.p_feasible, t.why_infeasible = 0.05, "no python sources"
+            t.certain = True
+        return  # a package in subfolders: the general agent takes it
     t.context["sources"] = "\n\n".join(f"### {k}\n{v}" for k, v in srcs.items())
     # A test that reads a data file which is not there usually cannot be satisfied by
     # editing the library. Not proof (the fix may be to stop needing it), so: one try.
