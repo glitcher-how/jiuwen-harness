@@ -36,6 +36,7 @@ _writable_cwd()
 
 from harness.llm import LLM, Ledger, BudgetExhausted, ProxyDown  # noqa: E402
 from harness.log import log  # noqa: E402
+from harness import solvers  # noqa: E402
 from harness.solvers import SOLVERS, Infeasible  # noqa: E402
 from harness.deterministic import det_solve  # noqa: E402
 from harness.tasks import load_tasks, analyze  # noqa: E402
@@ -127,12 +128,25 @@ async def main_async(args):
     results = Results(resolve_out(args.out, args.tasks_dir))
     log(f"budget={budget} out={results.path}")
 
+    # Assured mode: far more budget than tasks. That is the two-task qualifying run,
+    # where both tasks are feasible and one wrong answer disqualifies the team; tokens do
+    # not matter there, so every answer is confirmed by independent solutions.
+    per_task = (budget or 0) / max(len(tasks), 1)
+    assured = os.environ.get("ASSURE", "") == "1" or (
+        os.environ.get("ASSURE", "") != "0" and len(tasks) <= 10 and (budget is None or per_task >= 5000))
+    solvers.ASSURE = assured
+    log(f"mode: {'assured (verify every answer)' if assured else 'economy'}; "
+        f"{len(tasks)} tasks, budget per task {per_task:.0f}")
+
     # Proven infeasible -> never attempted. Only guessed infeasible -> attempted after
     # everything else, with a single cheap call: a wrong guess on a feasible task would
     # cost its reward (and in the 2-task qualifying run, the whole submission).
     todo = []
     for t in tasks:
         if t.reward <= 0:
+            continue
+        if assured:
+            todo.append(t)  # every task is treated as solvable and gets full effort
             continue
         if t.p_feasible < SKIP_BELOW and t.certain:
             t.status = "skipped"
@@ -157,7 +171,9 @@ async def main_async(args):
     await asyncio.gather(*(det_one(t) for t in todo))
     n_det = sum(t.det for t in todo)
     log(f"phase 1: {n_det}/{len(todo)} solved without the model in {time.time() - t_start:.1f}s")
-    todo = [t for t in todo if not t.det]
+    # coding tasks fixed by code still get the model's review for hidden-test traps
+    todo = [t for t in todo if not t.det
+            or (t.kind == "coding" and solvers.AUDIT and not t.deferred)]
 
     todo.sort(key=lambda t: (t.deferred, -t.priority))
     for t in todo:
@@ -177,14 +193,15 @@ async def main_async(args):
             except asyncio.QueueEmpty:
                 return
             if ledger.dead or time.time() - t_start > TIME_LIMIT:
-                t.status = "not_started"
+                t.status = t.status if t.answer else "not_started"
                 continue
             est = t.est_cost * ratio.get(t.kind, 1.0)
             if ledger.remaining() < est:
-                t.status = "too_expensive"
+                t.status = t.status if t.answer else "too_expensive"
                 log(f"[w{wid}] {t.id}: est {est:.0f} > remaining {ledger.remaining():.0f}")
                 continue
             t0 = time.time()
+            had = t.answer
             try:
                 ans = await asyncio.wait_for(SOLVERS[t.kind](t, llm), timeout=600)
                 ans = normalize_answer(t, (ans or "").strip())
@@ -199,6 +216,8 @@ async def main_async(args):
                 t.status = f"stopped: {type(e).__name__}"
             except Exception as e:  # noqa: BLE001 - one task must not kill the run
                 t.status = f"error: {type(e).__name__}: {str(e)[:200]}"
+            if had and t.status != "answered":
+                t.status = "answered"  # solved in phase 1; only the review did not finish
             t.spent = ledger.by_task.get(t.id, 0.0)
             if t.spent > 0:
                 r = t.spent / max(t.est_cost, 1.0)

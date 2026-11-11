@@ -255,6 +255,8 @@ def _an_search(t: Task) -> None:
     if wide != narrow:
         t.context["kb_wide"] = render(wide)  # retry context if the narrow one is not enough
     t.context["kb_linked"] = ", ".join(narrow)
+    if total <= 20000:
+        t.context["kb_all"] = render(list(docs))  # second opinion in assured mode
 
 
 # --- data analysis: schema summary instead of raw file
