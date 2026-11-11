@@ -45,32 +45,36 @@ ATTEMPTS = {"math": 1.1, "data_analysis": 1.1, "search": 1.0, "coding": 1.4, "ge
 _BOILER = [
     r"Work only inside the current directory\.?",
     r"The directory [\w./-]+ contains a small knowledge base of markdown files\.",
-    r"\s*\((?:for example|e\.g\.)[^)]*\)",
+    r"echo\s+\S+\s*>+\s*`?answer\.txt`?",
 ]
 # Words that say nothing about the problem itself: tools, delivery of the answer.
 _FILLER = set("""a an the to of in into inside with and or then it its this that your you are is be as by for
 no not use using compute computed calculate find get run do done when after all once finished work only just
 single final answer result value line file files tool tools bash python python3 c py current directory write
 save put store print output word number integer text other nothing else must should contain containing named
-called exactly please make sure them there txt ls grep cat tests pass edit""".split())
-_TRIGGER = re.compile(r"answer\.txt|\bbash\b|\bpython3?\b|file tools?|current directory", re.I)
+called exactly please make sure them there txt ls grep cat tests pass edit example e g eg such like via
+here""".split())
+_TRIGGER = re.compile(r"answer\.txt|\bbash\b|\bpython3?\b|file tools?|current directory|\bwrite only\b", re.I)
 _TOOL = r"(?:the )?(?:bash tool|bash|python3?(?: -c)?|file tools?)"
 
 
 def _housekeeping(sent: str) -> bool:
     """A sentence only about tools or about delivering the answer. One that also carries
-    a condition of the problem ("Use bash to sum the rows excluding cancelled ones") is
-    not housekeeping: dropping it would change the task."""
+    a condition of the problem ("Use bash to sum the rows excluding cancelled ones",
+    "Write the negated result to answer.txt") is not housekeeping: dropping it would
+    change the task, so a single unknown word is enough to keep the sentence."""
     if not _TRIGGER.search(sent):
         return False
-    words = re.findall(r"[A-Za-z0-9_']+", sent.lower())
-    return sum(w not in _FILLER for w in words) <= 1
+    words = re.findall(r"[A-Za-z0-9_']+", re.sub(r"`?[\w./-]+\.(?:py|txt)\b`?", " ", sent.lower()))
+    return all(w in _FILLER for w in words)
 
 
 def clean_instruction(text: str) -> str:
     q = text
     for pat in _BOILER:
         q = re.sub(pat, "", q, flags=re.I)
+    # "(for example, python3 -c)" goes; "(for example, 2.5 rounds to 3)" is a rule and stays
+    q = re.sub(r"\s*\(([^()]*)\)", lambda m: "" if _housekeeping(m.group(1)) else m.group(0), q)
     # How to deliver the answer and which tools to use is the harness's business, and the
     # model must not act on it. Only the housekeeping words go; conditions stay.
     keep = []
@@ -163,10 +167,13 @@ def estimate_cost(t: Task) -> float:
 def _an_math(t: Task) -> None:
     if not re.search(r"\d", t.question):
         t.p_feasible, t.why_infeasible = 0.2, "no numbers in problem"
-    if re.search(r"\b(?:split|divided?|shared?|distributed?)\b[^.?!]*?"
+    # The zero must belong to the division itself: the first "into/by/among" after the
+    # verb. "Divide 10 by 2 and increase the result by 0" is an ordinary problem. Even so
+    # this is a guess from the wording, so the task is postponed, not dropped.
+    if re.search(r"\b(?:split|divided?|shared?|distributed?)\b"
+                 r"(?:(?!\b(?:into|by|among|between)\b)[^.?!])*"
                  r"\b(?:into|by|among|between)\s+0\b(?![.,]?\d)", t.question, re.I):
         t.p_feasible, t.why_infeasible = 0.05, "division by zero in the statement"
-        t.certain = True
     first = re.split(r"(?<=[.!?])\s", t.question, maxsplit=1)[0]
     if not re.search(r"\d", first) and re.search(
             r"\b(unknown|unrecorded|unspecified|undisclosed|not recorded|some number|an? (?:certain|unknown) (?:number|amount))\b",
@@ -247,6 +254,11 @@ def _an_search(t: Task) -> None:
             if any(re.search(r"[a-z]", w) for w in words if w not in ("of", "and", "de", "von", "van", "the")):
                 names.add(_norm(n.replace("'s", "")))
     names.discard("")
+    # "Find Alice Smith" is the name "Alice Smith" behind a capitalised verb: every
+    # tail of at least two words counts as the name too
+    for n in list(names):
+        w = n.split()
+        names.update(" ".join(w[i:]) for i in range(1, len(w) - 1))
     seeds = [p for n in names for p in by_title.get(n, [])]
     if not seeds:
         # unknown entity -> very likely an infeasible question; still try body search
@@ -298,9 +310,10 @@ def _an_search(t: Task) -> None:
     if wide != narrow:
         t.context["kb_wide"] = render(wide)  # retry context if the narrow one is not enough
     t.context["kb_linked"] = ", ".join(narrow)
-    if total <= 20000:
+    if total <= 60000:
         # every card: for questions over the whole base (counts, extremes, reverse
-        # links) and as a second look when the linked cards do not hold the answer
+        # links) and, while the base is small, as a second look when the linked cards
+        # do not hold the answer
         t.context["kb_all"] = render(list(docs), limit=None)
 
 

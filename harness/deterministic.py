@@ -195,8 +195,9 @@ def solve_search(t: Task) -> Optional[str]:
     if not q:
         return None
     # the question must be the whole task: a sentence before it may carry a condition
-    if not re.fullmatch(r"(?:The (?:directory|folder) \S+ (?:contains|holds) [^.?!]*\.)?",
-                        t.question[:q.start()].strip()):
+    lead = t.question[:q.start()].strip()
+    if not re.fullmatch(r"(?:The (?:directory|folder) \S+ (?:contains|holds) [^.?!;:]*\.)?", lead) \
+            or re.search(r"\b(?:only|except|exclud\w*|ignor\w*|current|latest|valid|use)\b", lead, re.I):
         return None
     cards = _load_cards(kb)
     if not cards:

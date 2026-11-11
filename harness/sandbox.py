@@ -67,7 +67,31 @@ def run_test_file(tf: str, cwd: str, timeout: int = 60) -> Run:
         m = _RAN.search(r2.err + r2.out)
         if m and int(m.group(1)) > 0:
             return r2
+        # plain test_* functions without unittest: call them one by one
+        r3 = _run([PY, "-c", _PLAIN_TESTS, os.path.splitext(os.path.basename(tf))[0]], cwd, timeout)
+        m = _RAN.search(r3.err + r3.out)
+        if m and int(m.group(1)) > 0:
+            return r3
     return r
+
+
+_PLAIN_TESTS = """
+import importlib, sys, traceback
+sys.path.insert(0, '.')
+m = importlib.import_module(sys.argv[1])
+n = bad = 0
+for k, f in sorted(vars(m).items()):
+    own = getattr(f, '__module__', None) == m.__name__
+    if k.startswith('test') and callable(f) and own and not isinstance(f, type):
+        n += 1
+        try:
+            f()
+        except Exception:
+            bad += 1
+            traceback.print_exc()
+print('Ran %d tests in 0s' % n, file=sys.stderr)
+sys.exit(1 if bad else 0)
+"""
 
 
 def _run(argv, cwd, timeout) -> Run:

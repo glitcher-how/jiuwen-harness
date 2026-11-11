@@ -9,6 +9,7 @@ import os
 import re
 import shutil
 import tempfile
+import threading
 from typing import Optional
 
 from .llm import LLM, MODELS, NATIVE_TOOLS
@@ -110,7 +111,10 @@ async def _program(task: Task, llm: LLM, user: str, model: str, max_tokens: int 
         ans = _answer_line(r.out) if r is not None and r.ok else None
         if ans and ans.upper().startswith(IMPOSSIBLE):
             raise Infeasible("model says impossible")
-        if ans:
+        # a reply cut off inside the code block is half a program: whatever it printed
+        # is not the answer, even if it ran
+        cut = reply.truncated and reply.content.count("```") % 2 == 1
+        if ans and not (cut and regrown < 2 and not task.deferred):
             return _num_clean(ans)
         if r is None and IMPOSSIBLE in reply.content.upper():
             raise Infeasible("model says impossible")
@@ -237,8 +241,19 @@ async def solve_data(task: Task, llm: LLM) -> Optional[str]:
                             run(model=MODELS["think"], max_tokens=think_cap),
                             run(model=MODELS["think"], max_tokens=think_cap, retry_model=MODELS["think"],
                                 retry_tokens=think_cap)], task.prior)
-    return await _program(task, llm, user + " If a value the answer depends on is blank or "
-                          f"missing, print {IMPOSSIBLE}.", MODELS["fast"], max_tokens=fast_cap)
+    # A first program that crashed means the table is not what the cheap model assumed;
+    # the second attempt goes to the reasoning model instead of repeating the guess.
+    q = user + f" If a value the answer depends on is blank or missing, print {IMPOSSIBLE}."
+    try:
+        return await _program(task, llm, q, MODELS["fast"], max_tokens=fast_cap,
+                              retry_model=MODELS["think"], retry_tokens=think_cap)
+    except Infeasible:
+        if task.deferred:
+            raise
+    # The cheap model gives up too easily on a messy table (an empty cell the task itself
+    # tells how to read). Nothing else pointed at an unsolvable task, so "impossible" is
+    # accepted only if the reasoning model, asked from scratch, says the same.
+    return await _program(task, llm, q, MODELS["think"], max_tokens=think_cap)
 
 
 # ------------------------------------------------------------------ search
@@ -279,7 +294,7 @@ async def solve_search(task: Task, llm: LLM) -> Optional[str]:
         # points to, and "not in these cards" is not "not in the base".
         if _WHOLE_BASE.search(task.question):
             contexts = [whole]
-        else:
+        elif len(whole) <= 20000:
             contexts.append(whole)
     # The model without reasoning answers lookups well but picks the wrong card when the
     # question needs filtering or comparing, and guesses when the KB is silent. Unfamiliar
@@ -357,6 +372,11 @@ def _run_tests(cwd: str, tests):
     return ok, "\n".join(outs)
 
 
+def _assigned(n) -> list:
+    targets = n.targets if isinstance(n, ast.Assign) else [n.target]
+    return [t.id for t in targets if isinstance(t, ast.Name)]
+
+
 def splice(original: str, patch: str) -> str:
     """Replace top-level defs/classes of `original` by same-named ones in `patch`."""
     try:
@@ -375,18 +395,18 @@ def splice(original: str, patch: str) -> str:
 
     repl = {}
     new_imports, appended = [], []
+    have_imports = {ast.dump(n) for n in po.body if isinstance(n, (ast.Import, ast.ImportFrom))}
     for n in pp.body:
         if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             s, e = span(n, plines)
             repl[n.name] = "".join(plines[s:e]).rstrip() + "\n"
         elif isinstance(n, (ast.Import, ast.ImportFrom)):
             seg = "".join(plines[n.lineno - 1:n.end_lineno])
-            if seg.strip() not in original:
+            if ast.dump(n) not in have_imports:
                 new_imports.append(seg.rstrip() + "\n")
-        elif isinstance(n, ast.Assign):
+        elif isinstance(n, (ast.Assign, ast.AnnAssign)):
             seg = "".join(plines[n.lineno - 1:n.end_lineno]).rstrip() + "\n"
-            names = [t.id for t in n.targets if isinstance(t, ast.Name)]
-            for nm in names:
+            for nm in _assigned(n):
                 repl["=" + nm] = seg
     edits = []
     seen = set()
@@ -394,8 +414,8 @@ def splice(original: str, patch: str) -> str:
         key = None
         if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             key = n.name
-        elif isinstance(n, ast.Assign):
-            names = [t.id for t in n.targets if isinstance(t, ast.Name)]
+        elif isinstance(n, (ast.Assign, ast.AnnAssign)):
+            names = _assigned(n)
             key = "=" + names[0] if len(names) == 1 else None
         if key and key in repl:
             s, e = span(n, lines)
@@ -507,6 +527,9 @@ SYS_AUDIT = ("You review a Python module whose visible tests already pass. Hidde
              f"correct, {_NO} OK.")
 
 
+_COMMIT = threading.Lock()
+
+
 async def _audit(task: Task, llm: LLM, cwd: str, target: str, tests, model: str) -> None:
     """Review the fixed module for bugs the visible tests miss. A proposed change is kept
     only if the visible tests still pass; anything else leaves the file as it was."""
@@ -514,6 +537,9 @@ async def _audit(task: Task, llm: LLM, cwd: str, target: str, tests, model: str)
     with open(tpath, encoding="utf-8") as f:
         src = f.read()
     guard = {t: _sha(os.path.join(cwd, t)) for t in tests}
+    # The handler runs in a worker thread and outlives a cancelled review (timeout, end
+    # of the run). Once the review is over it must not touch the graded file any more.
+    over = threading.Event()
 
     def handler(code: str) -> str:
         try:
@@ -535,9 +561,12 @@ async def _audit(task: Task, llm: LLM, cwd: str, target: str, tests, model: str)
             shutil.rmtree(tmp, ignore_errors=True)
         if not ok or any(_sha(os.path.join(cwd, t)) != h for t, h in guard.items()):
             return "rejected: the visible tests fail with this change"
-        with open(tpath + ".new", "w", encoding="utf-8") as f:
-            f.write(patched)
-        os.replace(tpath + ".new", tpath)
+        with _COMMIT:
+            if over.is_set():
+                return "rejected: the review is over"
+            with open(tpath + ".new", "w", encoding="utf-8") as f:
+                f.write(patched)
+            os.replace(tpath + ".new", tpath)
         return "accepted"
 
     parts = []
@@ -546,7 +575,11 @@ async def _audit(task: Task, llm: LLM, cwd: str, target: str, tests, model: str)
             parts.append(f"### {t}\n" + f.read())
     prompt = (f"Task text: {task.question}\n\n### {target}\n```python\n{src}\n```\n\n" + "\n\n".join(parts))
     cap = _review_cap(src) if model == "think" else _budget(src, 600, 1.5, 4000)
-    await llm.session(task.id, SYS_AUDIT, "apply_fix", handler).ask(prompt, MODELS[model], cap)
+    try:
+        await llm.session(task.id, SYS_AUDIT, "apply_fix", handler).ask(prompt, MODELS[model], cap)
+    finally:
+        with _COMMIT:
+            over.set()
 
 
 def _target(task: Task, tests) -> Optional[str]:
@@ -565,7 +598,7 @@ def review_cost(task: Task) -> Optional[float]:
     target = _target(task, tests) if tests else None
     if not target:
         return None
-    size = 0
+    size = len(task.question) + 600
     for f in [target] + list(tests):
         size += os.path.getsize(os.path.join(task.cwd, f))
     return _review_cap(open(os.path.join(task.cwd, target), encoding="utf-8").read()) + size / 30.0 + 100

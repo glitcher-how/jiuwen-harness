@@ -42,7 +42,8 @@ from harness.deterministic import det_solve  # noqa: E402
 from harness.tasks import load_tasks, analyze  # noqa: E402
 
 SKIP_BELOW = 0.1          # p_feasible under this -> do not spend tokens
-TIME_LIMIT = float(os.environ.get("TIME_LIMIT_SEC", 3300))  # hard stop is 1h
+TIME_LIMIT = float(os.environ.get("TIME_LIMIT_SEC", 3300))  # no new task after this; hard stop is 1h
+HARD_STOP = TIME_LIMIT + 180  # a task already running is cut off here
 
 
 class Results:
@@ -213,7 +214,9 @@ async def main_async(args):
             t0 = time.time()
             had = t.answer
             try:
-                ans = await asyncio.wait_for(SOLVERS[t.kind](t, llm), timeout=600)
+                # no task may run past the hour the container is given
+                room = max(30.0, HARD_STOP - (time.time() - t_start))
+                ans = await asyncio.wait_for(SOLVERS[t.kind](t, llm), timeout=min(600, room))
                 ans = normalize_answer(t, (ans or "").strip())
                 if ans:
                     t.answer, t.status = ans, "answered"
@@ -237,21 +240,44 @@ async def main_async(args):
 
     await asyncio.gather(*(worker(i) for i in range(sem_workers)))
 
-    # Phase 3: every task has had its attempt, so what is left of the budget cannot earn
-    # a new answer. It pays for a second review of the solved coding tasks by the
-    # reasoning model: the graders run tests the harness has not seen. A review starts
-    # only if its worst case fits into the budget together with the reviews in flight.
-    if solvers.AUDIT and not assured and os.environ.get("SPARE_REVIEW", "1") != "0":
-        queue = [t for t in tasks if t.kind == "coding" and t.answer and not t.deferred]
-        queue.sort(key=lambda t: -t.reward)
+    # A task that broke for a technical reason (timeout, exception, a call the proxy
+    # kept refusing) gets one
+    # more attempt before any budget goes to reviews: a new answer is worth more.
+    again = [t for t in todo if not t.answer and t.status.startswith(("error:", "stopped: ProxyDown"))
+             and "tests still failing" not in t.status and "program failed" not in t.status]
+    if again and not ledger.dead:
+        log(f"retrying {len(again)} tasks that failed technically")
+        pending.extend(again)
+        await asyncio.gather(*(worker(i) for i in range(sem_workers)))
+
+    # Phase 3: the solved coding tasks get a second review by the reasoning model, because
+    # the graders run tests the harness has not seen. It is paid from what is left of the
+    # budget, tasks with the most reward per token first. SPARE_REVIEW_SHARE caps it at a
+    # share of the budget (0.1 = at most 10%) for the case when equal scores are expected
+    # and the cheaper run wins. A review starts only if its worst case fits into what is
+    # left together with the reviews in flight.
+    share = float(os.environ.get("SPARE_REVIEW_SHARE", "1"))
+    if solvers.AUDIT and not assured and os.environ.get("SPARE_REVIEW", "1") != "0" and share > 0:
+        costs = {}
+        for t in tasks:
+            if t.kind == "coding" and t.answer and not t.deferred:
+                need = await asyncio.to_thread(solvers.review_cost, t)
+                if need is not None:
+                    costs[t.id] = need
+        queue = sorted((t for t in tasks if t.id in costs), key=lambda t: -t.reward / costs[t.id])
         held = [0.0]
+        start_spent = ledger.spent
+        allowance = share * budget if budget else float("inf")
 
         async def reviewer():
             while queue:
                 t = queue.pop(0)
                 left = TIME_LIMIT - (time.time() - t_start)
-                need = await asyncio.to_thread(solvers.review_cost, t)
-                if ledger.dead or left < 60 or need is None or ledger.remaining() - held[0] < need:
+                need = costs[t.id]
+                used = ledger.spent - start_spent
+                # typical review costs about a third of its worst case
+                fits = ledger.remaining() - held[0] >= need and used + held[0] / 3 < allowance
+                if ledger.dead or left < 60 or not fits:
                     continue
                 held[0] += need
                 try:
