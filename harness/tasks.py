@@ -123,8 +123,21 @@ def analyze(t: Task) -> None:
 
 
 def estimate_cost(t: Task) -> float:
+    """Expected spend on the task, in budget units, before any model call.
+
+    The harness builds the prompt itself, so the input side is known. The output side
+    grows with the problem: a nine-operation word problem needs a longer program than a
+    one-line sum. Fitted on collected trajectories (short tasks of the organisers' kind
+    and long bureaucratic ones): about 2.7 output tokens per token of a math problem
+    and 2.2 per token of a data question."""
     inp_chars = len(t.question) + sum(len(v) for v in t.context.values()) + 450
-    return (inp_chars / 3.3 / 10.0 + EXPECTED_OUT.get(t.kind, 500)) * ATTEMPTS.get(t.kind, 1.2)
+    base = (inp_chars / 3.3 / 10.0 + EXPECTED_OUT.get(t.kind, 500)) * ATTEMPTS.get(t.kind, 1.2)
+    q_tokens = len(t.question) / 3.5
+    if t.kind == "math":
+        return max(base, 2.7 * q_tokens - 100)
+    if t.kind == "data_analysis":
+        return max(base, 2.2 * q_tokens - 70)
+    return base
 
 
 def _an_math(t: Task) -> None:
@@ -328,7 +341,8 @@ def _an_data(t: Task) -> None:
             lines.append(f"warning: {len(bad)} malformed rows")
         summ.append("\n".join(lines))
         # quoted literals that appear in no categorical column -> probably infeasible
-        quoted = re.findall(r"'([^']+)'|\"([^\"]+)\"", t.question)
+        # a short literal in quotes; an apostrophe inside a word (employee's) is not a quote
+        quoted = re.findall(r"(?<![A-Za-z])'([^'\n]{1,40})'(?![A-Za-z])|\"([^\"\n]{1,40})\"", t.question)
         allvals = set().union(*values.values()) if values else set()
         for a, b in quoted:
             v = a or b

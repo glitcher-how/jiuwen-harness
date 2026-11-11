@@ -74,6 +74,13 @@ def _num_clean(ans: str) -> str:
     return a
 
 
+def _budget(text: str, base: int, per_token: float, top: int) -> int:
+    """Output cap for one call. A cap is a guard against a model that loops, not a
+    target: it has to leave room for a long problem (a nine-step word problem needs a
+    longer program than a one-line sum), so it grows with the size of the input."""
+    return int(min(top, base + per_token * len(text) / 3.5))
+
+
 async def _program(task: Task, llm: LLM, user: str, model: str, max_tokens: int = 400,
                    retry_model: str = "", retry_tokens: int = 0, system: str = "") -> str:
     state = {}
@@ -83,39 +90,56 @@ async def _program(task: Task, llm: LLM, user: str, model: str, max_tokens: int 
         state["run"] = r
         return clip(r.out if r.ok else (r.err or r.out or "no output"), 800)
 
-    agent = llm.session(task.id, system or SYS_CODE, "run_python", handler)
-    if task.deferred:  # probably infeasible: one short try only
-        max_tokens = min(max_tokens, 200)
-    text = user
-    for attempt in range(1 if task.deferred else 2):
-        first = attempt == 0
+    def fresh():
+        return llm.session(task.id, system or SYS_CODE, "run_python", handler)
+
+    agent = fresh()
+    cap = max_tokens
+    # A deferred (probably infeasible) task gets one try with the normal cap: a model
+    # that sees the gap answers IMPOSSIBLE in a few tokens, and if the guess was wrong
+    # the task is still solved.
+    text, use = user, model
+    failures = regrown = 0
+    while True:
         state.clear()
-        reply = await agent.ask(text, model if first else (retry_model or MODELS["fast"]),
-                                max_tokens if first else (retry_tokens or max_tokens))
+        reply = await agent.ask(text, use, cap)
         r = state.get("run")
-        if r is None:
-            if IMPOSSIBLE in reply.content.upper():
-                raise Infeasible("model says impossible")
-            text = _via("run_python", "the program") + "."
-            continue
-        ans = _answer_line(r.out) if r.ok else None
+        ans = _answer_line(r.out) if r is not None and r.ok else None
         if ans and ans.upper().startswith(IMPOSSIBLE):
             raise Infeasible("model says impossible")
-        if r.ok and ans:
+        if ans:
             return _num_clean(ans)
-        if task.kind == "math" and "ZeroDivisionError" in r.err:
+        if r is None and IMPOSSIBLE in reply.content.upper():
+            raise Infeasible("model says impossible")
+        if r is not None and task.kind == "math" and "ZeroDivisionError" in r.err:
             raise Infeasible("division by zero")
-        text = ("It failed. Fix the program and call run_python again." if NATIVE_TOOLS else
-                "It failed:\n" + clip(r.err or r.out or "no output", 800)
-                + "\nFix it. One ```python``` block only.")
+        if task.deferred:
+            break
+        if reply.truncated and regrown < 2:
+            # Cut off by the cap, not wrong: ask again from scratch with more room,
+            # instead of paying to resend half a program and its syntax error.
+            regrown += 1
+            cap = min(cap * 3, 16000)
+            agent, text = fresh(), user
+            continue
+        failures += 1
+        if failures >= 2:
+            break
+        use, cap = retry_model or MODELS["fast"], max(cap, retry_tokens)
+        if r is None:
+            text = _via("run_python", "the program") + "."
+        else:
+            text = ("It failed. Fix the program and call run_python again." if NATIVE_TOOLS else
+                    "It failed:\n" + clip(r.err or r.out or "no output", 800)
+                    + "\nFix it. One ```python``` block only.")
     raise RuntimeError("program failed")
 
 
 # ------------------------------------------------------------------ math
-
-SYS_STEPS = (_via("run_python", "a Python 3 program, no comments") + ". Write exactly one assignment "
-             "per sentence of the problem, in order (x = <start>, then x = <x after that sentence>), "
-             "using every number as written, then print(x). Do not merge, reorder or skip sentences. "
+SYS_STEPS = (_via("run_python", "a Python 3 program, no comments") + ". Simulate the problem literally: "
+             "one variable per quantity it tracks, and one statement per operation or sentence, in "
+             "the stated order, using every number as written. Do not merge, reorder or skip "
+             "operations and do not compute anything in your head. Print only the requested value. "
              f"If the problem is contradictory or lacks a number it needs, {_NO} {IMPOSSIBLE}.")
 
 
@@ -128,6 +152,9 @@ async def solve_math(task: Task, llm: LLM) -> Optional[str]:
     solvers is a free proof. Disagreement goes to the reasoning model with the stricter
     prompt. Result: 71/71 at 161 tokens per task, against 70/71 at 286 for the reasoning
     model alone."""
+    fast_cap = _budget(task.question, 350, 2.5, 4000)
+    think_cap = _budget(task.question, 1500, 10, 12000)
+
     async def attempt(**kw):
         try:
             return await _program(task, llm, task.question, **kw)
@@ -141,19 +168,19 @@ async def solve_math(task: Task, llm: LLM) -> Optional[str]:
 
         def run(**kw):
             return lambda: _program(task, llm, q, **kw)
-        return await _vote([run(model=MODELS["fast"], max_tokens=350),
-                            run(model=MODELS["fast"], max_tokens=350, system=SYS_STEPS),
-                            run(model=MODELS["think"], max_tokens=1500, system=SYS_STEPS),
-                            run(model=MODELS["think"], max_tokens=1500)])
-    first = await attempt(model=MODELS["fast"], max_tokens=350)
+        return await _vote([run(model=MODELS["fast"], max_tokens=fast_cap),
+                            run(model=MODELS["fast"], max_tokens=fast_cap, system=SYS_STEPS),
+                            run(model=MODELS["think"], max_tokens=think_cap, system=SYS_STEPS),
+                            run(model=MODELS["think"], max_tokens=think_cap)])
+    first = await attempt(model=MODELS["fast"], max_tokens=fast_cap)
     if task.deferred:  # probably infeasible: one cheap try only
         if first in (None, IMPOSSIBLE):
             raise Infeasible("model says impossible")
         return first
-    second = await attempt(model=MODELS["fast"], max_tokens=350, system=SYS_STEPS)
+    second = await attempt(model=MODELS["fast"], max_tokens=fast_cap, system=SYS_STEPS)
     answer = first if first is not None and first == second else await attempt(
-        model=MODELS["think"], max_tokens=1500, system=SYS_STEPS,
-        retry_model=MODELS["think"], retry_tokens=1500)
+        model=MODELS["think"], max_tokens=think_cap, system=SYS_STEPS,
+        retry_model=MODELS["think"], retry_tokens=think_cap)
     if answer is None:
         raise RuntimeError("program failed")
     if answer == IMPOSSIBLE:
@@ -196,17 +223,19 @@ async def solve_data(task: Task, llm: LLM) -> Optional[str]:
            + ". Write the shortest code that prints the answer; do not reread files.")
     user = (f"Files in the working directory (summary):\n{task.context.get('data', '')}{note}\n\n"
             f"Task: {task.question}\n{pre}")
+    fast_cap = _budget(task.question, 300, 2.5, 4000)
+    think_cap = _budget(task.question, 1500, 10, 12000)
     if ASSURE:
         q = user + SOLVABLE
 
         def run(**kw):
             return lambda: _program(task, llm, q, **kw)
-        return await _vote([run(model=MODELS["fast"], max_tokens=300),
-                            run(model=MODELS["think"], max_tokens=1500),
-                            run(model=MODELS["think"], max_tokens=2500, retry_model=MODELS["think"],
-                                retry_tokens=2500)])
+        return await _vote([run(model=MODELS["fast"], max_tokens=fast_cap),
+                            run(model=MODELS["think"], max_tokens=think_cap),
+                            run(model=MODELS["think"], max_tokens=think_cap, retry_model=MODELS["think"],
+                                retry_tokens=think_cap)])
     return await _program(task, llm, user + " If a value the answer depends on is blank or "
-                          f"missing, print {IMPOSSIBLE}.", MODELS["fast"], max_tokens=300)
+                          f"missing, print {IMPOSSIBLE}.", MODELS["fast"], max_tokens=fast_cap)
 
 
 # ------------------------------------------------------------------ search
@@ -228,13 +257,15 @@ async def solve_search(task: Task, llm: LLM) -> Optional[str]:
 
         def run(kb, model, limit):
             return lambda: _search_once(task, llm, kb, model, limit, SOLVABLE)
-        return await _vote([run(wide, MODELS["think"], 1200), run(whole, MODELS["think"], 1500),
-                            run(whole, MODELS["fast"], 40), run(whole, MODELS["think"], 2500)])
+        cap = _budget(whole + task.question, 1500, 4, 12000)
+        return await _vote([run(wide, MODELS["think"], cap), run(whole, MODELS["think"], cap),
+                            run(whole, MODELS["fast"], 40), run(whole, MODELS["think"], cap * 2)])
     contexts = [task.context.get("kb_wide") or task.context.get("kb", "")]
     # The model without reasoning answers lookups well but picks the wrong card when the
     # question needs filtering or comparing, and guesses when the KB is silent. Unfamiliar
     # questions therefore go to the reasoning model; a probably-infeasible one stays cheap.
-    model, limit = (MODELS["fast"], 24) if task.deferred else (MODELS["think"], 1200)
+    model, limit = (MODELS["fast"], 24) if task.deferred else (
+        MODELS["think"], _budget(contexts[0] + task.question, 1200, 4, 12000))
     for kb in contexts:
         try:
             return await _search_once(task, llm, kb, model, limit)
@@ -245,7 +276,11 @@ async def solve_search(task: Task, llm: LLM) -> Optional[str]:
 
 async def _search_once(task: Task, llm: LLM, kb: str, model: str, limit: int, note: str = "") -> str:
     user = f"Knowledge base:\n{kb}\n\nQuestion: {task.question}{note}"
-    reply = (await llm.session(task.id, SYS_SEARCH).ask(user, model, limit)).content
+    got = await llm.session(task.id, SYS_SEARCH).ask(user, model, limit)
+    if got.truncated and model == MODELS["think"] and not got.content.strip():
+        # the reasoning ran into the cap before any answer: once more with room
+        got = await llm.session(task.id, SYS_SEARCH).ask(user, model, min(limit * 3, 16000))
+    reply = got.content
     ans = reply.strip().splitlines()[0].strip() if reply.strip() else ""
     ans = re.sub(r"^(answer|final answer)\s*[:\-]\s*", "", ans, flags=re.I).strip().strip("*`'\". ")
     if ans and not ans.upper().startswith(IMPOSSIBLE) and ans.lower() not in ("unknown", "none", "n/a"):
@@ -476,8 +511,8 @@ async def _audit(task: Task, llm: LLM, cwd: str, target: str, tests, model: str)
         with open(os.path.join(cwd, t), encoding="utf-8") as f:
             parts.append(f"### {t}\n" + f.read())
     prompt = (f"Task text: {task.question}\n\n### {target}\n```python\n{src}\n```\n\n" + "\n\n".join(parts))
-    await llm.session(task.id, SYS_AUDIT, "apply_fix", handler).ask(
-        prompt, MODELS[model], 3000 if model == "think" else 600)
+    cap = _budget(src, 3000, 6, 16000) if model == "think" else _budget(src, 600, 1.5, 4000)
+    await llm.session(task.id, SYS_AUDIT, "apply_fix", handler).ask(prompt, MODELS[model], cap)
 
 
 async def solve_coding(task: Task, llm: LLM) -> Optional[str]:
@@ -511,9 +546,10 @@ async def _fix_until_tests_pass(task: Task, llm: LLM, cwd: str, tests, target) -
         return await solve_generic(task, llm)
     tpath = os.path.join(cwd, target)
     original = open(tpath, encoding="utf-8").read()
-    plan = [(MODELS["fast"], 700)] + ([] if task.deferred else [(MODELS["fast"], 900)])
+    fast_cap = _budget(original, 700, 1.5, 5000)  # a patch is at most about the file itself
+    plan = [(MODELS["fast"], fast_cap)] + ([] if task.deferred else [(MODELS["fast"], fast_cap)])
     if os.environ.get("CODING_ESCALATE", "1") != "0" and not task.deferred:
-        plan.append((MODELS["think"], 3000))
+        plan.append((MODELS["think"], _budget(original, 3000, 6, 16000)))
     state = {"current": original, "ok": False, "out": out}
 
     def handler(code: str) -> str:
@@ -543,6 +579,12 @@ async def _fix_until_tests_pass(task: Task, llm: LLM, cwd: str, tests, target) -
             agent = llm.session(task.id, SYS_FIX, "apply_fix", handler)
             reply = await agent.ask(_coding_prompt(target, state["current"], cwd, tests, state["out"]),
                                     model, mt)
+            if reply.truncated and not state["ok"] and not task.deferred:
+                # the patch was cut off by the cap: same request again with more room
+                agent = llm.session(task.id, SYS_FIX, "apply_fix", handler)
+                reply = await agent.ask(
+                    _coding_prompt(target, state["current"], cwd, tests, state["out"]),
+                    model, min(mt * 3, 16000))
             if not reply.called and IMPOSSIBLE in reply.content:
                 raise Infeasible("model says tests contradict")
             if state["ok"]:

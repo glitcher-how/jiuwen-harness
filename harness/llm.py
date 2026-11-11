@@ -250,6 +250,7 @@ class MeteredModel(Model):
 class Reply:
     content: str   # the model's text (empty when it only called the tool)
     called: bool   # the tool ran (called by the model, or recovered from a code block)
+    truncated: bool = False  # the model hit max_tokens: the reply is cut off
 
 
 class AgentSession:
@@ -300,7 +301,8 @@ class AgentSession:
             raise call["err"]
         if call["last"] is None:
             raise ProxyDown("the agent made no model call")
-        return Reply(content, call["called"])
+        return Reply(content, call["called"],
+                     str(getattr(call["last"], "finish_reason", "")).lower() == "length")
 
 
 class LLM:
