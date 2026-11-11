@@ -22,7 +22,7 @@ from concurrent.futures import ThreadPoolExecutor
 from queue import Queue
 from typing import Dict, List, Optional
 
-from .sandbox import PY, run_argv, run_python
+from .sandbox import run_python, run_test_file
 from .tasks import Task, sniff_delimiter
 
 ENABLED = os.environ.get("DET", "1") != "0"
@@ -91,12 +91,18 @@ def solve_data(t: Task) -> Optional[str]:
     m = _Q_UNITS.search(t.question)
     if not m or t.question.rstrip()[-len(m.group(0)):] != m.group(0):
         return None
+    # Nothing but the file description may precede the question: an extra sentence
+    # ("Exclude cancelled rows.") is a condition this solver does not understand.
+    before = t.question.rstrip()[:-len(m.group(0))].strip()
+    if not re.fullmatch(r"(?:The file [\w.-]+ has columns [\w,]+(?: \(\d+ rows\))?\.)?", before):
+        return None
     measure, col, value, rcol, lo, hi = m.groups()
     with open(path, encoding="utf-8", newline="") as f:
-        rows = list(csv.DictReader(f, delimiter=sniff_delimiter(path)))
+        reader = csv.DictReader(f, delimiter=sniff_delimiter(path))
+        head = list(reader.fieldnames or [])
+        rows = list(reader)
     if not rows:
         return None
-    head = list(rows[0].keys())
     need = [measure, col] + ([rcol] if rcol else [])
     if any(c not in head for c in need) or len(set(head)) != len(head):
         return None
@@ -187,6 +193,10 @@ def solve_search(t: Task) -> Optional[str]:
         return None
     q = re.search(r"((?:In which|Which|Who)\b[^.?]*\?)\s*$", t.question)
     if not q:
+        return None
+    # the question must be the whole task: a sentence before it may carry a condition
+    if not re.fullmatch(r"(?:The (?:directory|folder) \S+ (?:contains|holds) [^.?!]*\.)?",
+                        t.question[:q.start()].strip()):
         return None
     cards = _load_cards(kb)
     if not cards:
@@ -304,7 +314,7 @@ def _failing(cwd: str, tests: List[str], timeout: int = 15) -> Optional[set]:
     """Names of failing tests; None if the run broke in a way we cannot attribute."""
     bad = set()
     for tf in tests:
-        r = run_argv([PY, tf], cwd, timeout=timeout)
+        r = run_test_file(tf, cwd, timeout=timeout)
         if r.timeout:
             return None
         names = set(_FAILED.findall(r.err + r.out))

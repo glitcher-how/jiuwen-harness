@@ -126,18 +126,18 @@ def _dispatch(arg: str) -> str:
 
 @tool(name="run_python", description="Run a Python 3 program in the task directory; returns its output.")
 async def run_python_tool(code: str) -> str:
-    return _dispatch(code)
+    return await asyncio.to_thread(_dispatch, code)  # a running program must not stall other workers
 
 
 @tool(name="apply_fix", description="Replace functions of the buggy module with the given corrected "
                                     "definitions and run the tests; returns the test result.")
 async def apply_fix_tool(code: str) -> str:
-    return _dispatch(code)
+    return await asyncio.to_thread(_dispatch, code)
 
 
 @tool(name="bash", description="Run a shell command in the task directory; returns its output.")
 async def bash_tool(command: str) -> str:
-    return _dispatch(command)
+    return await asyncio.to_thread(_dispatch, command)
 
 
 TOOLS = {"run_python": run_python_tool, "apply_fix": apply_fix_tool, "bash": bash_tool}

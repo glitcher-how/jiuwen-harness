@@ -54,6 +54,22 @@ def run_argv(argv, cwd, timeout: int = 30) -> Run:
     return _run(argv, cwd, timeout)
 
 
+_RAN = re.compile(r"^Ran (\d+) tests? in", re.M)
+
+
+def run_test_file(tf: str, cwd: str, timeout: int = 60) -> Run:
+    """Run one test file the way the tasks say: python3 FILE. A file without a
+    unittest.main() call exits with 0 without running a single test, so when no test
+    reported itself the file goes through the unittest runner instead."""
+    r = _run([PY, tf], cwd, timeout)
+    if r.ok and not _RAN.search(r.err + r.out):
+        r2 = _run([PY, "-m", "unittest", tf], cwd, timeout)
+        m = _RAN.search(r2.err + r2.out)
+        if m and int(m.group(1)) > 0:
+            return r2
+    return r
+
+
 def _run(argv, cwd, timeout) -> Run:
     try:
         p = subprocess.run(argv, cwd=cwd, capture_output=True, timeout=timeout,

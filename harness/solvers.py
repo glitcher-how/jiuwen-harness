@@ -7,10 +7,12 @@ import ast
 import hashlib
 import os
 import re
+import shutil
+import tempfile
 from typing import Optional
 
 from .llm import LLM, MODELS, NATIVE_TOOLS
-from .sandbox import clip, run_python, run_shell, run_argv, PY
+from .sandbox import clip, run_python, run_shell, run_test_file
 from .tasks import Task
 
 IMPOSSIBLE = "IMPOSSIBLE"
@@ -40,11 +42,12 @@ ASSURE = False
 SOLVABLE = "\nThis task is known to be solvable with the given data: always give an answer."
 
 
-async def _vote(candidates):
+async def _vote(candidates, prior=None):
     """Run independent solvers until two of them agree; return that answer.
-    Without agreement the last answer wins (candidates go from cheap to strong)."""
+    Without agreement the last answer wins (candidates go from cheap to strong).
+    `prior` is the answer of the zero-token solver: it counts as one voice."""
     from collections import Counter
-    answers = []
+    answers = [prior] if prior else []
     for make in candidates:
         try:
             a = await make()
@@ -171,7 +174,7 @@ async def solve_math(task: Task, llm: LLM) -> Optional[str]:
         return await _vote([run(model=MODELS["fast"], max_tokens=fast_cap),
                             run(model=MODELS["fast"], max_tokens=fast_cap, system=SYS_STEPS),
                             run(model=MODELS["think"], max_tokens=think_cap, system=SYS_STEPS),
-                            run(model=MODELS["think"], max_tokens=think_cap)])
+                            run(model=MODELS["think"], max_tokens=think_cap)], task.prior)
     first = await attempt(model=MODELS["fast"], max_tokens=fast_cap)
     if task.deferred:  # probably infeasible: one cheap try only
         if first in (None, IMPOSSIBLE):
@@ -193,15 +196,14 @@ async def solve_math(task: Task, llm: LLM) -> Optional[str]:
 # Runs before the model's code, so the model writes one expression instead of csv
 # boilerplate (about half the output tokens). Numbers are already converted.
 PRELUDE = {"data_analysis": r'''
-import csv as _csv, glob as _glob
+import csv as _csv, glob as _glob, re as _re
 def _conv(v):
-    try:
-        return int(v)
-    except (TypeError, ValueError):
-        try:
-            return float(v)
-        except (TypeError, ValueError):
-            return v
+    s = v.strip() if isinstance(v, str) else ''
+    if _re.fullmatch(r'-?(0|[1-9]\d*)', s):
+        return int(s)
+    if _re.fullmatch(r'-?(0|[1-9]\d*)\.\d+', s):
+        return float(s)
+    return v  # '007', '1e3', 'nan' are codes and words, not numbers
 tables = {}
 for _f in sorted(_glob.glob('**/*.csv', recursive=True) + _glob.glob('**/*.tsv', recursive=True)):
     with open(_f, newline='', encoding='utf-8', errors='replace') as _h:
@@ -218,7 +220,8 @@ rows = next(iter(tables.values())) if len(tables) == 1 else None
 async def solve_data(task: Task, llm: LLM) -> Optional[str]:
     note = f"\nNote: {task.context['note']}" if task.context.get("note") else ""
     one = task.context.get("data", "").count("data rows") == 1
-    pre = ("Preloaded variables: `tables` = {filename: list of row dicts}, numeric fields already int/float"
+    pre = ("Preloaded variables: `tables` = {filename: list of row dicts}, plain numbers already int/float "
+           "(codes like 007 stay strings)"
            + ("; `rows` = rows of the only table" if one else "")
            + ". Write the shortest code that prints the answer; do not reread files.")
     user = (f"Files in the working directory (summary):\n{task.context.get('data', '')}{note}\n\n"
@@ -233,7 +236,7 @@ async def solve_data(task: Task, llm: LLM) -> Optional[str]:
         return await _vote([run(model=MODELS["fast"], max_tokens=fast_cap),
                             run(model=MODELS["think"], max_tokens=think_cap),
                             run(model=MODELS["think"], max_tokens=think_cap, retry_model=MODELS["think"],
-                                retry_tokens=think_cap)])
+                                retry_tokens=think_cap)], task.prior)
     return await _program(task, llm, user + " If a value the answer depends on is blank or "
                           f"missing, print {IMPOSSIBLE}.", MODELS["fast"], max_tokens=fast_cap)
 
@@ -245,6 +248,13 @@ SYS_SEARCH = ("Answer the question using only the knowledge base. Facts may need
               "written in the KB, no sentence. Apply every condition of the question (day, role, "
               "earliest/latest) before choosing. If the KB does not contain the answer or does not "
               f"single out one value, reply {IMPOSSIBLE}.")
+
+
+_WHOLE_BASE = re.compile(r"\b(how many|number of|count|total|all|every|each|any|most|least|fewest|"
+                         r"oldest|youngest|earliest|latest|newest|largest|smallest|highest|lowest|"
+                         r"longest|shortest|more than|fewer than|less than|at least|at most|"
+                         r"which (?:person|people|employee|employees|company|companies|team|teams)|"
+                         r"who (?:works|work|is employed|reports|leads|manages|mentors))\b", re.I)
 
 
 async def solve_search(task: Task, llm: LLM) -> Optional[str]:
@@ -259,14 +269,24 @@ async def solve_search(task: Task, llm: LLM) -> Optional[str]:
             return lambda: _search_once(task, llm, kb, model, limit, SOLVABLE)
         cap = _budget(whole + task.question, 1500, 4, 12000)
         return await _vote([run(wide, MODELS["think"], cap), run(whole, MODELS["think"], cap),
-                            run(whole, MODELS["fast"], 40), run(whole, MODELS["think"], cap * 2)])
+                            run(whole, MODELS["fast"], 40), run(whole, MODELS["think"], cap * 2)],
+                           task.prior)
     contexts = [task.context.get("kb_wide") or task.context.get("kb", "")]
+    whole = task.context.get("kb_all")
+    if whole and whole != contexts[0] and not task.deferred:
+        # Linked cards are found by walking forward from the names in the question.
+        # Counts, extremes and reverse links ("who works at X") need cards nobody
+        # points to, and "not in these cards" is not "not in the base".
+        if _WHOLE_BASE.search(task.question):
+            contexts = [whole]
+        else:
+            contexts.append(whole)
     # The model without reasoning answers lookups well but picks the wrong card when the
     # question needs filtering or comparing, and guesses when the KB is silent. Unfamiliar
     # questions therefore go to the reasoning model; a probably-infeasible one stays cheap.
-    model, limit = (MODELS["fast"], 24) if task.deferred else (
-        MODELS["think"], _budget(contexts[0] + task.question, 1200, 4, 12000))
+    model = MODELS["fast"] if task.deferred else MODELS["think"]
     for kb in contexts:
+        limit = 24 if task.deferred else _budget(kb + task.question, 1200, 4, 12000)
         try:
             return await _search_once(task, llm, kb, model, limit)
         except Infeasible:
@@ -330,7 +350,7 @@ def _test_files(cwd: str):
 def _run_tests(cwd: str, tests):
     outs, ok = [], True
     for tf in tests:
-        r = run_argv([PY, tf], cwd, timeout=60)
+        r = run_test_file(tf, cwd, timeout=60)
         if not r.ok:
             ok = False
         outs.append(f"$ python3 {tf}\n{r.err}{r.out}")
@@ -386,8 +406,17 @@ def splice(original: str, patch: str) -> str:
     for k, v in repl.items():
         if k not in seen:
             appended.append("\n\n" + v)
-    out = "".join(new_imports) + "".join(lines) + "".join(appended)
-    ast.parse(out)
+    # new imports go below the module docstring and the __future__ imports
+    at = 0
+    for k, n in enumerate(po.body):
+        if (k == 0 and isinstance(n, ast.Expr) and isinstance(getattr(n, "value", None), ast.Constant)
+                and isinstance(n.value.value, str)) or (
+                isinstance(n, ast.ImportFrom) and n.module == "__future__"):
+            at = n.end_lineno
+        else:
+            break
+    out = "".join(lines[:at]) + "".join(new_imports) + "".join(lines[at:]) + "".join(appended)
+    compile(out, "<patched>", "exec")  # stricter than ast.parse: catches a misplaced import
     return out
 
 
@@ -447,22 +476,19 @@ def _compact(target: str, src: str, cwd: str, tests, out: str) -> Optional[str]:
             + "\n\n" + "\n".join(errors))
 
 
-def _fail_signature(out: str):
-    """Which tests fail and with what error, ignoring line numbers and timings."""
-    return tuple(sorted(set(re.findall(
-        r"^(?:FAIL|ERROR): \w+|^\w*(?:Error|Exception)\b.*$", out, re.M))))
-
-
-def _coding_prompt(target: str, src: str, cwd: str, tests, out: str) -> str:
+def _coding_prompt(task: Task, target: str, src: str, cwd: str, tests, out: str) -> str:
+    # the task text may hold the contract (what the function must do) that tests only sample
+    head = f"Task: {task.question}\n\n"
     short = _compact(target, src, cwd, tests, out)
     if short:
-        return short
+        return head + short
     parts = []
     for t in tests:
         with open(os.path.join(cwd, t), encoding="utf-8") as f:
             parts.append(f"### {t}\n" + f.read())
     test_src = "\n\n".join(parts)
-    return f"### {target}\n```python\n{src}\n```\n\n{test_src}\n\nTest output:\n{clip(out, 1800)}"
+    return (head + f"### {target}\n```python\n{src}\n```\n\n{test_src}"
+            f"\n\nTest output:\n{clip(out, 1800)}")
 
 
 # The graders run their own, larger test file. After the visible tests pass, one more
@@ -494,17 +520,25 @@ async def _audit(task: Task, llm: LLM, cwd: str, target: str, tests, model: str)
             patched = splice(src, code)
         except SyntaxError as e:
             return f"SyntaxError: {e}"
+        # The change is tried in a copy: the file that will be graded is replaced only
+        # after the tests passed, so a kill in the middle leaves the tested version.
+        tmp = tempfile.mkdtemp(prefix="audit_")
         try:
-            with open(tpath, "w", encoding="utf-8") as f:
+            d = os.path.join(tmp, "w")
+            shutil.copytree(cwd, d, ignore=shutil.ignore_patterns("__pycache__", "answer.txt"))
+            with open(os.path.join(d, target), "w", encoding="utf-8") as f:
                 f.write(patched)
-            ok, _ = _run_tests(cwd, tests)
-            if ok and all(_sha(os.path.join(cwd, t)) == h for t, h in guard.items()):
-                return "accepted"
+            ok, _ = _run_tests(d, tests)
         except Exception:
-            pass
-        with open(tpath, "w", encoding="utf-8") as f:
-            f.write(src)
-        return "rejected: the visible tests fail with this change"
+            ok = False
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+        if not ok or any(_sha(os.path.join(cwd, t)) != h for t, h in guard.items()):
+            return "rejected: the visible tests fail with this change"
+        with open(tpath + ".new", "w", encoding="utf-8") as f:
+            f.write(patched)
+        os.replace(tpath + ".new", tpath)
+        return "accepted"
 
     parts = []
     for t in tests:
@@ -569,21 +603,16 @@ async def _fix_until_tests_pass(task: Task, llm: LLM, cwd: str, tests, target) -
         return "all tests pass" if state["ok"] else "tests still fail"
 
     try:
-        sig0 = _fail_signature(out)
         for model, mt in plan:
-            if model == MODELS["think"] and _fail_signature(state["out"]) == sig0:
-                # two patches changed nothing about how the tests fail: the cause is not
-                # in this file, and the expensive model would only burn budget on it
-                raise Infeasible("patches do not change the failure")
             # every round is a fresh agent: it sees the current file and current failures only
             agent = llm.session(task.id, SYS_FIX, "apply_fix", handler)
-            reply = await agent.ask(_coding_prompt(target, state["current"], cwd, tests, state["out"]),
-                                    model, mt)
+            reply = await agent.ask(_coding_prompt(task, target, state["current"], cwd, tests,
+                                                   state["out"]), model, mt)
             if reply.truncated and not state["ok"] and not task.deferred:
                 # the patch was cut off by the cap: same request again with more room
                 agent = llm.session(task.id, SYS_FIX, "apply_fix", handler)
                 reply = await agent.ask(
-                    _coding_prompt(target, state["current"], cwd, tests, state["out"]),
+                    _coding_prompt(task, target, state["current"], cwd, tests, state["out"]),
                     model, min(mt * 3, 16000))
             if not reply.called and IMPOSSIBLE in reply.content:
                 raise Infeasible("model says tests contradict")

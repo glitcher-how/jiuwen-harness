@@ -165,8 +165,12 @@ async def main_async(args):
             ans = await asyncio.to_thread(det_solve, t)
         ans = normalize_answer(t, (ans or "").strip())
         if ans:
-            t.answer, t.status, t.det = ans, "answered", True
+            t.answer, t.status = ans, "answered"
             results.save(t, ans)
+            if assured and t.kind != "coding":
+                t.prior = ans  # assured mode confirms this answer with the model as well
+            else:
+                t.det = True
 
     await asyncio.gather(*(det_one(t) for t in todo))
     n_det = sum(t.det for t in todo)
@@ -181,16 +185,22 @@ async def main_async(args):
 
     # online calibration: actual / estimated cost per kind
     ratio = {}
-    queue = asyncio.Queue()
-    for t in todo:
-        queue.put_nowait(t)
+    pending = list(todo)
     sem_workers = max(1, min(args.workers, 5))
+
+    def take():
+        """Next task: the best reward per expected token, with the estimates corrected by
+        what tasks of that kind have actually cost so far; doubtful ones go last."""
+        if not pending:
+            return None
+        t = min(pending, key=lambda x: (x.deferred, -x.priority / ratio.get(x.kind, 1.0)))
+        pending.remove(t)
+        return t
 
     async def worker(wid: int):
         while True:
-            try:
-                t = queue.get_nowait()
-            except asyncio.QueueEmpty:
+            t = take()
+            if t is None:
                 return
             if ledger.dead or time.time() - t_start > TIME_LIMIT:
                 t.status = t.status if t.answer else "not_started"

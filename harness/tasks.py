@@ -24,6 +24,7 @@ class Task:
     why_infeasible: str = ""
     certain: bool = False       # infeasibility proven, not guessed: never attempt
     deferred: bool = False      # guessed infeasible: attempt last, once, if budget remains
+    prior: Optional[str] = None  # answer of the zero-token solver, to be confirmed (assured mode)
     det: bool = False           # solved by code, without the model
     context: Dict[str, str] = field(default_factory=dict)
     est_cost: float = 0.0
@@ -43,27 +44,46 @@ ATTEMPTS = {"math": 1.1, "data_analysis": 1.1, "search": 1.0, "coding": 1.4, "ge
 
 _BOILER = [
     r"Work only inside the current directory\.?",
-    r"When you are done,[^.]*?answer\.txt[^.]*?(\([^)]*\))?\.",
-    r"Compute it with the bash tool[^.]*\.",
-    r"Use bash with python3? to compute it\.",
-    r"Use the file tools or bash[^.]*?(\([^)]*\))?[^.]*\.",
     r"The directory [\w./-]+ contains a small knowledge base of markdown files\.",
+    r"\s*\((?:for example|e\.g\.)[^)]*\)",
 ]
+# Words that say nothing about the problem itself: tools, delivery of the answer.
+_FILLER = set("""a an the to of in into inside with and or then it its this that your you are is be as by for
+no not use using compute computed calculate find get run do done when after all once finished work only just
+single final answer result value line file files tool tools bash python python3 c py current directory write
+save put store print output word number integer text other nothing else must should contain containing named
+called exactly please make sure them there txt ls grep cat tests pass edit""".split())
+_TRIGGER = re.compile(r"answer\.txt|\bbash\b|\bpython3?\b|file tools?|current directory", re.I)
+_TOOL = r"(?:the )?(?:bash tool|bash|python3?(?: -c)?|file tools?)"
+
+
+def _housekeeping(sent: str) -> bool:
+    """A sentence only about tools or about delivering the answer. One that also carries
+    a condition of the problem ("Use bash to sum the rows excluding cancelled ones") is
+    not housekeeping: dropping it would change the task."""
+    if not _TRIGGER.search(sent):
+        return False
+    words = re.findall(r"[A-Za-z0-9_']+", sent.lower())
+    return sum(w not in _FILLER for w in words) <= 1
 
 
 def clean_instruction(text: str) -> str:
     q = text
     for pat in _BOILER:
         q = re.sub(pat, "", q, flags=re.I)
-    # Any other wording of the same housekeeping: how to deliver the answer, which tools
-    # to use. The harness does both itself, and the model must not act on them.
+    # How to deliver the answer and which tools to use is the harness's business, and the
+    # model must not act on it. Only the housekeeping words go; conditions stay.
     keep = []
     for sent in re.split(r"(?<=[.?!])\s+(?=[A-Z`])", q):
-        if "answer.txt" in sent:
+        if _housekeeping(sent):
             continue
-        if re.match(r"(Use|Compute it with|Work only)\b", sent) and re.search(
-                r"\bbash\b|python3|file tools|current directory", sent):
-            continue
+        if _TRIGGER.search(sent):
+            s = re.sub(r"\s+(?:to|in|into)\s+(?:the\s+)?(?:file\s+)?`?answer\.txt`?"
+                       r"(?:\s+in the current directory)?", "", sent)
+            if s != sent:
+                s = re.sub(r"^(?:Write|Save|Put|Store)\b", "Give", s)
+            s = re.sub(rf"^(?:Use|Using) {_TOOL}(?: (?:with|or|and) {_TOOL})*(?: tool)? to ", "", s)
+            sent = s[:1].upper() + s[1:]
         keep.append(sent)
     return re.sub(r"\s+", " ", " ".join(keep)).strip()
 
@@ -143,7 +163,8 @@ def estimate_cost(t: Task) -> float:
 def _an_math(t: Task) -> None:
     if not re.search(r"\d", t.question):
         t.p_feasible, t.why_infeasible = 0.2, "no numbers in problem"
-    if re.search(r"\b(?:into|by|among|between|over)\s+0\s+\w+", t.question):
+    if re.search(r"\b(?:split|divided?|shared?|distributed?)\b[^.?!]*?"
+                 r"\b(?:into|by|among|between)\s+0\b(?![.,]?\d)", t.question, re.I):
         t.p_feasible, t.why_infeasible = 0.05, "division by zero in the statement"
         t.certain = True
     first = re.split(r"(?<=[.!?])\s", t.question, maxsplit=1)[0]
@@ -254,9 +275,9 @@ def _an_search(t: Task) -> None:
     company_fact = bool(re.search(r"headquarter|founded|located|\bcity\b|\bceo\b|founder|industry", ql))
     need = 1 + person_links + int(company_fact)
 
-    def render(paths):
+    def render(paths, limit=25):
         if paths:
-            chosen = paths[:25]           # only the entity-linked cards
+            chosen = paths[:limit]        # only the entity-linked cards
         elif total <= 6000:
             chosen = list(docs)           # nothing matched: small KB goes in whole
         else:
@@ -269,7 +290,9 @@ def _an_search(t: Task) -> None:
         t.context["kb_wide"] = render(wide)  # retry context if the narrow one is not enough
     t.context["kb_linked"] = ", ".join(narrow)
     if total <= 20000:
-        t.context["kb_all"] = render(list(docs))  # second opinion in assured mode
+        # every card: for questions over the whole base (counts, extremes, reverse
+        # links) and as a second look when the linked cards do not hold the answer
+        t.context["kb_all"] = render(list(docs), limit=None)
 
 
 # --- data analysis: schema summary instead of raw file
@@ -493,7 +516,8 @@ def contradictory_asserts(src: str, libs: Optional[Dict[str, str]] = None):
             continue
         if not isinstance(call, ast.Call) or lib_func(call) is None:
             continue  # methods of objects built in the test are stateful by nature
-        key = ast.dump(call)
+        # assertTrue(f(1)) and assertEqual(f(1), 2) do not contradict: 2 is truthy
+        key = ("truth:" if meth in ("assertTrue", "assertFalse") else "eq:") + ast.dump(call)
         if key in seen and seen[key] != val:
             why = f"{ast.unparse(call)} expected both {seen[key]!r} and {val!r}"
             if lib_func(call) in pure and literal_args(call):
