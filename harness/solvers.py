@@ -545,8 +545,39 @@ async def _audit(task: Task, llm: LLM, cwd: str, target: str, tests, model: str)
         with open(os.path.join(cwd, t), encoding="utf-8") as f:
             parts.append(f"### {t}\n" + f.read())
     prompt = (f"Task text: {task.question}\n\n### {target}\n```python\n{src}\n```\n\n" + "\n\n".join(parts))
-    cap = _budget(src, 3000, 6, 16000) if model == "think" else _budget(src, 600, 1.5, 4000)
+    cap = _review_cap(src) if model == "think" else _budget(src, 600, 1.5, 4000)
     await llm.session(task.id, SYS_AUDIT, "apply_fix", handler).ask(prompt, MODELS[model], cap)
+
+
+def _target(task: Task, tests) -> Optional[str]:
+    targets = [f for f in os.listdir(task.cwd) if f.endswith(".py") and f not in tests]
+    m = re.search(r"bugs? in ([\w./-]+\.py)", task.instruction)
+    return m.group(1) if m and m.group(1) in targets else (targets[0] if len(targets) == 1 else None)
+
+
+def _review_cap(src: str) -> int:
+    return _budget(src, 3000, 6, 16000)
+
+
+def review_cost(task: Task) -> Optional[float]:
+    """Worst-case cost of review_coding, or None if the task has nothing to review."""
+    tests = _test_files(task.cwd)
+    target = _target(task, tests) if tests else None
+    if not target:
+        return None
+    size = 0
+    for f in [target] + list(tests):
+        size += os.path.getsize(os.path.join(task.cwd, f))
+    return _review_cap(open(os.path.join(task.cwd, target), encoding="utf-8").read()) + size / 30.0 + 100
+
+
+async def review_coding(task: Task, llm: LLM) -> None:
+    """Second review of a solved coding task by the reasoning model. run_agent calls it
+    after every task was attempted, with the budget that is left over."""
+    tests = _test_files(task.cwd)
+    target = _target(task, tests) if tests else None
+    if target:
+        await _audit(task, llm, task.cwd, target, tests, "think")
 
 
 async def solve_coding(task: Task, llm: LLM) -> Optional[str]:
@@ -554,14 +585,12 @@ async def solve_coding(task: Task, llm: LLM) -> Optional[str]:
     tests = _test_files(cwd)
     if not tests:
         return await solve_generic(task, llm)
-    targets = [f for f in os.listdir(cwd) if f.endswith(".py") and f not in tests]
-    m = re.search(r"bugs? in ([\w./-]+\.py)", task.instruction)
-    target = m.group(1) if m and m.group(1) in targets else (targets[0] if len(targets) == 1 else None)
+    target = _target(task, tests)
     answer = await _fix_until_tests_pass(task, llm, cwd, tests, target)
     if answer == "DONE" and AUDIT and target and not task.deferred:
-        # Measured on 40 tasks with a hidden second bug and 40 without: the cheap model
-        # finds 36 of 40 at ~80 tokens per task and breaks nothing; the reasoning model
-        # finds 39 but costs 540-1070 per task, so it reviews only in assured mode.
+        # The cheap model reviews here (~100 tokens per task). The reasoning model finds
+        # more but costs ~1000 per task: in assured mode it reviews right away, otherwise
+        # run_agent gives it whatever budget is left once every task was attempted.
         for model in ([AUDIT_MODEL, "think"] if ASSURE else [AUDIT_MODEL]):
             try:
                 await _audit(task, llm, cwd, target, tests, model)

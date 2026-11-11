@@ -237,6 +237,33 @@ async def main_async(args):
 
     await asyncio.gather(*(worker(i) for i in range(sem_workers)))
 
+    # Phase 3: every task has had its attempt, so what is left of the budget cannot earn
+    # a new answer. It pays for a second review of the solved coding tasks by the
+    # reasoning model: the graders run tests the harness has not seen. A review starts
+    # only if its worst case fits into the budget together with the reviews in flight.
+    if solvers.AUDIT and not assured and os.environ.get("SPARE_REVIEW", "1") != "0":
+        queue = [t for t in tasks if t.kind == "coding" and t.answer and not t.deferred]
+        queue.sort(key=lambda t: -t.reward)
+        held = [0.0]
+
+        async def reviewer():
+            while queue:
+                t = queue.pop(0)
+                left = TIME_LIMIT - (time.time() - t_start)
+                need = await asyncio.to_thread(solvers.review_cost, t)
+                if ledger.dead or left < 60 or need is None or ledger.remaining() - held[0] < need:
+                    continue
+                held[0] += need
+                try:
+                    await asyncio.wait_for(solvers.review_coding(t, llm), timeout=min(600, left))
+                except Exception:  # noqa: BLE001 - the answer is already saved and tested
+                    pass
+                held[0] -= need
+                before, t.spent = t.spent, ledger.by_task.get(t.id, 0.0)
+                log(f"review {t.id}: cost={t.spent - before:.0f} total={ledger.spent:.0f}")
+
+        await asyncio.gather(*(reviewer() for _ in range(min(sem_workers, 3))))
+
     solved = [t for t in tasks if t.status == "answered"]
     log(f"DONE: answered {len(solved)}/{len(tasks)}, reward claimed "
         f"{sum(t.reward for t in solved):g}, spent {ledger.spent:.0f} "
