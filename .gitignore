@@ -3,3 +3,6 @@ __pycache__/
 *.env
 .env*
 logs/
+*.mp3
+*.wav
+*.m4a

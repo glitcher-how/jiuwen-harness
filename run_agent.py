@@ -14,10 +14,13 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+START_DIR = os.getcwd()
+
 
 def _writable_cwd():
-    """openJiuwen writes ./logs relative to the cwd at import time; the container runs
-    with --read-only and --workdir /app, so move to a writable place first."""
+    """openJiuwen creates ./logs in the current directory when it is imported, and the
+    container runs with --read-only and --workdir /app. Move to a writable place first;
+    relative paths from the command line are resolved against START_DIR."""
     if os.access(os.getcwd(), os.W_OK):
         return
     for d in (os.path.join(os.environ.get("TMPDIR", "/tmp"), "agent"), os.path.expanduser("~/agent")):
@@ -28,6 +31,8 @@ def _writable_cwd():
         except OSError:
             continue
 
+
+_writable_cwd()
 
 from harness.llm import LLM, Ledger, BudgetExhausted, ProxyDown  # noqa: E402
 from harness.log import log  # noqa: E402
@@ -227,10 +232,9 @@ def main():
     args, unknown = ap.parse_known_args()
     if unknown:  # never fail the run because of an unexpected flag
         log(f"ignoring unknown arguments: {unknown}")
-    args.tasks_dir = os.path.abspath(args.tasks_dir)
+    args.tasks_dir = os.path.normpath(os.path.join(START_DIR, args.tasks_dir))
     if args.out:
-        args.out = os.path.abspath(args.out)
-    _writable_cwd()  # before openJiuwen is imported (lazily, inside LLM)
+        args.out = os.path.normpath(os.path.join(START_DIR, args.out))
     asyncio.run(main_async(args))
 
 

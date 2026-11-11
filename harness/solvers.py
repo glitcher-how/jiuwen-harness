@@ -1,6 +1,6 @@
-"""Per-kind solvers. Each makes as few and as short LLM calls as possible:
-the harness gathers context itself, the model only writes the decisive bit,
-and the harness executes and checks it."""
+"""Per-kind solvers. Each one is an openJiuwen ReAct agent with at most one tool. The
+harness gathers the context itself, the model only writes the decisive bit (a short
+program, a patch, a value) as a tool call, and the tool executes and checks it."""
 from __future__ import annotations
 
 import ast
@@ -9,17 +9,24 @@ import os
 import re
 from typing import Optional
 
-from .llm import LLM, MODELS
-from .sandbox import clip, extract_code, run_python, run_shell, run_argv, PY
+from .llm import LLM, MODELS, NATIVE_TOOLS
+from .sandbox import clip, run_python, run_shell, run_argv, PY
 from .tasks import Task
 
 IMPOSSIBLE = "IMPOSSIBLE"
 
-SYS_CODE = ("You write minimal Python 3 programs. Reply with exactly one ```python``` code block "
-            "and nothing else, no comments. The program must print only the final answer (one line) "
-            "and must not write files. "
-            f"If the problem is contradictory or cannot be answered from the given data, "
-            f"print {IMPOSSIBLE}.")
+def _via(tool_name: str, what: str) -> str:
+    """How the model hands over its code: a tool call, or a fenced block for the same tool."""
+    if NATIVE_TOOLS:
+        return f"Call {tool_name} exactly once with {what}"
+    return f"Reply with exactly one ```python``` block and nothing else, containing {what}"
+
+
+_NO = "do not call the tool: reply" if NATIVE_TOOLS else "reply only"
+
+SYS_CODE = (_via("run_python", "a minimal Python 3 program, no comments") + ". The program must print "
+            "only the final answer (one line) and must not write files. If the problem is "
+            f"contradictory or cannot be answered from the given data, {_NO} {IMPOSSIBLE}.")
 
 
 class Infeasible(Exception):
@@ -38,46 +45,30 @@ def _num_clean(ans: str) -> str:
     return a
 
 
-def _mental_math(code: str) -> bool:
-    """True if the 'program' just prints a precomputed literal, e.g. print(9352)."""
-    body = [ln.strip() for ln in code.splitlines() if ln.strip() and not ln.strip().startswith("#")]
-    return len(body) == 1 and bool(re.fullmatch(r"print\(\s*-?[\d.]+\s*\)", body[0]))
-
-
-def _unused_numbers(problem: str, code: str) -> list:
-    """Numbers written in the problem that the program never mentions (as a multiset)."""
-    from collections import Counter
-    num = r"(?<![\w.])\d+(?:\.\d+)?(?![\w.])"
-    left = Counter(re.findall(num, problem)) - Counter(re.findall(num, code))
-    return sorted(left.elements(), key=float)
-
-
 async def _program(task: Task, llm: LLM, user: str, model: str, max_tokens: int = 400,
-                   system: str = "", retry_model: str = "", retry_tokens: int = 0) -> str:
-    msgs = [{"role": "system", "content": system or SYS_CODE}, {"role": "user", "content": user}]
-    feedback = None
+                   retry_model: str = "", retry_tokens: int = 0, system: str = "") -> str:
+    state = {}
+
+    def handler(code: str) -> str:
+        r = run_python(PRELUDE.get(task.kind, "") + code, task.cwd, timeout=30)
+        state["run"] = r
+        return clip(r.out if r.ok else (r.err or r.out or "no output"), 800)
+
+    agent = llm.session(task.id, system or SYS_CODE, "run_python", handler)
     if task.deferred:  # probably infeasible: one short try only
         max_tokens = min(max_tokens, 200)
+    text = user
     for attempt in range(1 if task.deferred else 2):
-        m = msgs if feedback is None else msgs + feedback
         first = attempt == 0
-        reply = await llm.chat(m, model=model if first else (retry_model or MODELS["fast"]),
-                               max_tokens=max_tokens if first else (retry_tokens or max_tokens),
-                               tag=f"{task.id}#{attempt}")
-        code = extract_code(reply)
-        if not code:
-            feedback = [{"role": "assistant", "content": reply},
-                        {"role": "user", "content": "Reply with one ```python``` block only."}]
+        state.clear()
+        reply = await agent.ask(text, model if first else (retry_model or MODELS["fast"]),
+                                max_tokens if first else (retry_tokens or max_tokens))
+        r = state.get("run")
+        if r is None:
+            if IMPOSSIBLE in reply.content.upper():
+                raise Infeasible("model says impossible")
+            text = _via("run_python", "the program") + "."
             continue
-        # the reasoning model may legitimately fold steps or compute a part itself
-        doubt = (_math_doubt(task.question, code)
-                 if task.kind == "math" and model != MODELS["think"] else "")
-        if doubt and first and not task.deferred and IMPOSSIBLE not in code:
-            # free checks say a step was lost or computed in the head: ask again
-            feedback = [{"role": "assistant", "content": f"```python\n{code}\n```"},
-                        {"role": "user", "content": doubt}]
-            continue
-        r = run_python(PRELUDE.get(task.kind, "") + code, task.cwd, timeout=30)
         ans = _answer_line(r.out) if r.ok else None
         if ans and ans.upper().startswith(IMPOSSIBLE):
             raise Infeasible("model says impossible")
@@ -85,35 +76,51 @@ async def _program(task: Task, llm: LLM, user: str, model: str, max_tokens: int 
             return _num_clean(ans)
         if task.kind == "math" and "ZeroDivisionError" in r.err:
             raise Infeasible("division by zero")
-        feedback = [{"role": "assistant", "content": f"```python\n{code}\n```"},
-                    {"role": "user", "content": "It failed:\n" + clip(r.err or r.out or "no output", 800)
-                     + "\nFix it. One ```python``` block only."}]
+        text = ("It failed. Fix the program and call run_python again." if NATIVE_TOOLS else
+                "It failed:\n" + clip(r.err or r.out or "no output", 800)
+                + "\nFix it. One ```python``` block only.")
     raise RuntimeError("program failed")
 
 
 # ------------------------------------------------------------------ math
 
-def _math_doubt(problem: str, code: str) -> str:
-    """Zero-token sanity checks of a math program; returns what to tell the model."""
-    if _mental_math(code):
-        return ("Do not compute in your head. Write one assignment per sentence, starting "
-                "from the numbers in the problem.")
-    skipped = _unused_numbers(problem, code)
-    if skipped:
-        return ("Your program never uses these numbers from the problem: "
-                f"{', '.join(skipped)}. Apply every sentence, in order.")
-    return ""
+SYS_STEPS = (_via("run_python", "a Python 3 program, no comments") + ". Write exactly one assignment "
+             "per sentence of the problem, in order (x = <start>, then x = <x after that sentence>), "
+             "using every number as written, then print(x). Do not merge, reorder or skip sentences. "
+             f"If the problem is contradictory or lacks a number it needs, {_NO} {IMPOSSIBLE}.")
 
 
 async def solve_math(task: Task, llm: LLM) -> Optional[str]:
-    # Only wordings the zero-token solver did not recognise get here. On such chains the
-    # model without reasoning loses or misreads a step about once in twenty tasks, and no
-    # free check catches all of those, so this path uses the reasoning model (low effort).
-    # A probably-infeasible task still gets one cheap try.
-    if task.deferred:
-        return await _program(task, llm, task.question, MODELS["fast"], max_tokens=350)
-    return await _program(task, llm, task.question, MODELS["think"], max_tokens=1500,
-                          retry_model=MODELS["think"], retry_tokens=1500)
+    """Two cheap independent solutions, and the reasoning model only if they disagree.
+
+    Only wordings the zero-token solver did not recognise get here. Measured on 71 such
+    tasks: each single solver loses or misreads a step in 1-4% of them (the reasoning
+    model too), but never the same way, so agreement of two differently prompted cheap
+    solvers is a free proof. Disagreement goes to the reasoning model with the stricter
+    prompt. Result: 71/71 at 161 tokens per task, against 70/71 at 286 for the reasoning
+    model alone."""
+    async def attempt(**kw):
+        try:
+            return await _program(task, llm, task.question, **kw)
+        except Infeasible:
+            return IMPOSSIBLE
+        except RuntimeError:
+            return None  # no usable program: counts as a disagreement
+
+    first = await attempt(model=MODELS["fast"], max_tokens=350)
+    if task.deferred:  # probably infeasible: one cheap try only
+        if first in (None, IMPOSSIBLE):
+            raise Infeasible("model says impossible")
+        return first
+    second = await attempt(model=MODELS["fast"], max_tokens=350, system=SYS_STEPS)
+    answer = first if first is not None and first == second else await attempt(
+        model=MODELS["think"], max_tokens=1500, system=SYS_STEPS,
+        retry_model=MODELS["think"], retry_tokens=1500)
+    if answer is None:
+        raise RuntimeError("program failed")
+    if answer == IMPOSSIBLE:
+        raise Infeasible("model says impossible")
+    return answer
 
 
 # ------------------------------------------------------------------ data analysis
@@ -173,11 +180,9 @@ async def solve_search(task: Task, llm: LLM) -> Optional[str]:
     # question needs filtering or comparing, and guesses when the KB is silent. Unfamiliar
     # questions therefore go to the reasoning model; a probably-infeasible one stays cheap.
     model, limit = (MODELS["fast"], 24) if task.deferred else (MODELS["think"], 1200)
-    for i, kb in enumerate(contexts):
+    for kb in contexts:
         user = f"Knowledge base:\n{kb}\n\nQuestion: {task.question}"
-        reply = await llm.chat([{"role": "system", "content": SYS_SEARCH},
-                                {"role": "user", "content": user}],
-                               model=model, max_tokens=limit, tag=f"{task.id}#{i}")
+        reply = (await llm.session(task.id, SYS_SEARCH).ask(user, model, limit)).content
         ans = reply.strip().splitlines()[0].strip() if reply.strip() else ""
         ans = re.sub(r"^(answer|final answer)\s*[:\-]\s*", "", ans, flags=re.I).strip().strip("*`'\". ")
         if ans and not ans.upper().startswith(IMPOSSIBLE) and ans.lower() not in ("unknown", "none", "n/a"):
@@ -208,11 +213,10 @@ def kb_spelling(ans: str, kb: str) -> str:
 
 SYS_FIX = ("You fix bugs in Python code. Hidden tests check other inputs too, so make each function "
            "correct for what its name and the tests intend, not just for the visible cases. "
-           "Reply with exactly one ```python``` block that contains ONLY the top-level functions/classes "
-           "you changed (complete definitions, plus any imports they need); omit unchanged ones. "
-           "Do not touch tests. "
+           + _via("apply_fix", "ONLY the top-level functions/classes you changed (complete definitions, "
+                  "plus any imports they need); omit unchanged ones") + ". Do not touch tests. "
            "Never create or edit data files. If the tests cannot pass by editing this code alone "
-           f"(they contradict each other, or need a file that is missing), reply {IMPOSSIBLE}.")
+           f"(they contradict each other, or need a file that is missing), {_NO} {IMPOSSIBLE}.")
 
 
 def _sha(path: str) -> str:
@@ -380,42 +384,42 @@ async def solve_coding(task: Task, llm: LLM) -> Optional[str]:
         return await solve_generic(task, llm)
     tpath = os.path.join(cwd, target)
     original = open(tpath, encoding="utf-8").read()
-    msgs = [{"role": "system", "content": SYS_FIX},
-            {"role": "user", "content": _coding_prompt(target, original, cwd, tests, out)}]
     plan = [(MODELS["fast"], 700)] + ([] if task.deferred else [(MODELS["fast"], 900)])
     if os.environ.get("CODING_ESCALATE", "1") != "0" and not task.deferred:
         plan.append((MODELS["think"], 3000))
-    current = original
+    state = {"current": original, "ok": False, "out": out}
+
+    def handler(code: str) -> str:
+        try:
+            patched = splice(state["current"], code)
+        except SyntaxError as e:
+            return f"SyntaxError: {e}"
+        state["current"] = patched
+        with open(tpath, "w", encoding="utf-8") as f:
+            f.write(patched)
+        state["ok"], state["out"] = _run_tests(cwd, tests)
+        for t, h in guard.items():  # tests must stay untouched
+            if _sha(os.path.join(cwd, t)) != h:
+                with open(os.path.join(cwd, t), "wb") as f:
+                    f.write(backup[t])
+                state["ok"], state["out"] = _run_tests(cwd, tests)
+        return "all tests pass" if state["ok"] else "tests still fail"
+
     try:
         sig0 = _fail_signature(out)
-        for i, (model, mt) in enumerate(plan):
-            if model == MODELS["think"] and _fail_signature(out) == sig0:
+        for model, mt in plan:
+            if model == MODELS["think"] and _fail_signature(state["out"]) == sig0:
                 # two patches changed nothing about how the tests fail: the cause is not
                 # in this file, and the expensive model would only burn budget on it
                 raise Infeasible("patches do not change the failure")
-            reply = await llm.chat(msgs, model=model, max_tokens=mt, tag=f"{task.id}#{i}")
-            if IMPOSSIBLE in reply and "```" not in reply:
+            # every round is a fresh agent: it sees the current file and current failures only
+            agent = llm.session(task.id, SYS_FIX, "apply_fix", handler)
+            reply = await agent.ask(_coding_prompt(target, state["current"], cwd, tests, state["out"]),
+                                    model, mt)
+            if not reply.called and IMPOSSIBLE in reply.content:
                 raise Infeasible("model says tests contradict")
-            code = extract_code(reply)
-            try:
-                current = splice(current, code)
-            except SyntaxError as e:
-                msgs += [{"role": "assistant", "content": reply},
-                         {"role": "user", "content": f"SyntaxError: {e}. Resend the corrected functions."}]
-                continue
-            with open(tpath, "w", encoding="utf-8") as f:
-                f.write(current)
-            ok, out = _run_tests(cwd, tests)
-            for t, h in guard.items():  # tests must stay untouched
-                if _sha(os.path.join(cwd, t)) != h:
-                    with open(os.path.join(cwd, t), "wb") as f:
-                        f.write(backup[t])
-                    ok, out = _run_tests(cwd, tests)
-            if ok:
+            if state["ok"]:
                 return "DONE"
-            # next round: show the current file and the new failures only
-            msgs = [{"role": "system", "content": SYS_FIX},
-                    {"role": "user", "content": _coding_prompt(target, current, cwd, tests, out)}]
         raise RuntimeError("tests still failing")
     finally:
         for t in tests:
@@ -426,37 +430,31 @@ async def solve_coding(task: Task, llm: LLM) -> Optional[str]:
 
 # ------------------------------------------------------------------ generic fallback (text ReAct)
 
-SYS_AGENT = ("You are a terse coding agent in a Linux shell. To act, reply with one ```bash``` block; "
-             "you will get its output. Keep commands short. When finished, reply with a line "
-             "`FINAL: <answer>` (the exact content for answer.txt) and no code block.")
+SYS_AGENT = ("You are a terse coding agent in a Linux shell. Use the bash tool to inspect files and "
+             "compute; keep commands short. When you know the answer, stop calling tools and reply "
+             "with one line `FINAL: <answer>` (the exact content for answer.txt). If the task cannot "
+             f"be solved with the given data, reply `FINAL: {IMPOSSIBLE}`.")
 
 
 async def solve_generic(task: Task, llm: LLM, max_steps: int = 8) -> Optional[str]:
-    msgs = [{"role": "system", "content": SYS_AGENT},
-            {"role": "user", "content": f"Working directory files:\n{task.context.get('files') or ''}"
-                                        f"\n\nTask: {task.instruction}"}]
-    for step in range(max_steps):
-        reply = await llm.chat(msgs, model=MODELS["fast"], max_tokens=600, tag=f"{task.id}#{step}")
-        fm = re.search(r"FINAL:\s*(.+)", reply)
-        cm = re.search(r"```(?:bash|sh)?\s*\n(.*?)```", reply, re.S)
-        if fm and not cm:
-            ans = fm.group(1).strip()
-            if ans.upper().startswith(IMPOSSIBLE):
-                raise Infeasible("agent gave up")
-            return ans
-        if not cm:
-            msgs += [{"role": "assistant", "content": reply},
-                     {"role": "user", "content": "Use a ```bash``` block or FINAL: <answer>."}]
-            continue
-        r = run_shell(cm.group(1), task.cwd, timeout=60)
-        obs = clip(f"exit={r.code}\n{r.out}\n{r.err}", 1500)
-        msgs += [{"role": "assistant", "content": reply}, {"role": "user", "content": obs}]
-        if len(msgs) > 12:  # context control: keep system, task, and the last exchanges
-            msgs = msgs[:2] + msgs[-8:]
+    def handler(command: str) -> str:
+        r = run_shell(command, task.cwd, timeout=60)
+        return clip(f"exit={r.code}\n{r.out}\n{r.err}", 1500)
+
+    agent = llm.session(task.id, SYS_AGENT, "bash", handler, max_iterations=max_steps)
+    reply = await agent.ask(f"Working directory files:\n{task.context.get('files') or ''}"
+                            f"\n\nTask: {task.instruction}", MODELS["fast"], 600)
+    fm = re.search(r"FINAL:\s*(.+)", reply.content)
+    if fm:
+        ans = fm.group(1).strip()
+        if ans.upper().startswith(IMPOSSIBLE):
+            raise Infeasible("agent gave up")
+        return ans
     # the agent may have written answer.txt itself
     p = os.path.join(task.cwd, "answer.txt")
     if os.path.exists(p):
-        return open(p, encoding="utf-8").read().strip()
+        with open(p, encoding="utf-8") as f:
+            return f.read().strip()
     raise RuntimeError("no answer")
 
 
