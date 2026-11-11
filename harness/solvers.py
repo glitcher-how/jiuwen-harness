@@ -12,7 +12,7 @@ import tempfile
 import threading
 from typing import Optional
 
-from .llm import LLM, MODELS, NATIVE_TOOLS
+from .llm import LLM, MODELS, NATIVE_TOOLS, BudgetExhausted, ProxyDown
 from .sandbox import clip, run_python, run_shell, run_test_file
 from .tasks import Task
 
@@ -56,6 +56,12 @@ async def _vote(candidates, prior=None):
             a = None
         except RuntimeError:
             a = None
+        except (BudgetExhausted, ProxyDown):
+            # out of budget in the middle of the vote: an unconfirmed answer is still
+            # worth more than none
+            if answers:
+                break
+            raise
         if a:
             answers.append(a)
             top, n = Counter(answers).most_common(1)[0]
