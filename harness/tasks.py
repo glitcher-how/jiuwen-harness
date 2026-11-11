@@ -237,7 +237,16 @@ def _an_search(t: Task) -> None:
                             os.path.splitext(os.path.basename(p))[0]))
         by_title.setdefault(stem, []).append(p)
 
-    names = {_norm(n.replace("'s", "")) for n in _NAME.findall(t.question.replace("'s ", " "))}
+    # A name never runs across a sentence boundary ("... named Jordan Pike. Capacity is")
+    # and is not a placeholder in capitals ("YYYY-MM-DD", "ID. Follow"): such false names
+    # are found nowhere in the base and would mark a solvable task as doubtful.
+    names = set()
+    for part in re.split(r"[.;:!?,()]\s+", t.question.replace("'s ", " ")):
+        for n in _NAME.findall(part):
+            words = re.split(r"[ -]", n)
+            if any(re.search(r"[a-z]", w) for w in words if w not in ("of", "and", "de", "von", "van", "the")):
+                names.add(_norm(n.replace("'s", "")))
+    names.discard("")
     seeds = [p for n in names for p in by_title.get(n, [])]
     if not seeds:
         # unknown entity -> very likely an infeasible question; still try body search
