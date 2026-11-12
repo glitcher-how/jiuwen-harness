@@ -267,24 +267,41 @@ class _Tables(dict):
     def __getitem__(self, k): return dict.__getitem__(self, self._key(k))
     def __contains__(self, k): return dict.__contains__(self, self._key(k))
     def get(self, k, d=None): return dict.get(self, self._key(k), d)
-tables = _Tables()
+_raw, _js = {}, {}
 for _f in sorted(_glob.glob('**/*.csv', recursive=True) + _glob.glob('**/*.tsv', recursive=True)):
     with open(_f, newline='', encoding='utf-8', errors='replace') as _h:
         _head = _h.readline()
         _h.seek(0)
         _delim = max(',;\t|', key=_head.count)
         _delim = _delim if _head.count(_delim) else ','
-        tables[_f.replace(chr(92), '/')] = [{k: _cell(v) for k, v in r.items()}
-                                            for r in _csv.DictReader(_h, delimiter=_delim)]
+        _raw[_f.replace(chr(92), '/')] = list(_csv.DictReader(_h, delimiter=_delim))
 for _f in sorted(_glob.glob('**/*.json', recursive=True)):
     try:
         import json as _json
         with open(_f, encoding='utf-8') as _h:
             _d = _json.load(_h)
         if isinstance(_d, list) and _d and all(isinstance(_r, dict) for _r in _d):
-            tables[_f.replace(chr(92), '/')] = _d
+            _js[_f.replace(chr(92), '/')] = _d
     except Exception:
         pass
+# A column is a column of codes, and stays text as a whole, if one of its values has a
+# leading zero (007 is not 7) or if most of its values are spelled as strings in a JSON file (the key
+# of a join: "7" there must equal the cell here). The same column name in another table
+# follows, so that a join between two tables compares like with like.
+_jstr = {_v.strip() for _t in _js.values() for _r in _t for _v in _r.values() if isinstance(_v, str)}
+_cols = {}
+for _t in _raw.values():
+    for _r in _t:
+        for _k, _v in _r.items():
+            if isinstance(_v, str) and _v.strip():
+                _cols.setdefault(_k, set()).add(_v.strip())
+_text = {_k for _k, _vs in _cols.items()
+         if any(_re.fullmatch(r'-?0\d+', _v) for _v in _vs) or 2 * len(_vs & _jstr) >= len(_vs)}
+tables = _Tables()
+for _f, _t in _raw.items():
+    tables[_f] = [{k: (v if k in _text else _cell(v)) for k, v in r.items()} for r in _t]
+for _f, _t in _js.items():
+    tables[_f] = _t
 rows = next(iter(tables.values())) if len(tables) == 1 and not _glob.glob('**/*.json', recursive=True) else None
 import builtins as _b, os as _os
 def open(f, *a, **k):  # the task says "workspace/x.csv", the program already runs inside workspace
@@ -301,7 +318,7 @@ async def solve_data(task: Task, llm: LLM) -> Optional[str]:
     found = [f for _, _, fs in os.walk(task.cwd) for f in fs if f.lower().endswith((".csv", ".tsv", ".json"))]
     one = len(found) == 1 and not found[0].lower().endswith(".json")  # same rule as `rows` in PRELUDE
     pre = ("Preloaded variables: `tables` = {filename: list of row dicts}, plain numbers already int/float "
-           "(codes like 007 stay strings)"
+           "(a column of codes like 007 stays text)"
            + ("; `rows` = rows of the only table" if one else "")
            + ". Write the shortest code that prints the answer; do not reread files.")
     user = (f"Files in the working directory (summary):\n{task.context.get('data', '')}{note}\n\n"
