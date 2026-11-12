@@ -54,6 +54,9 @@ MODELS = {
 NATIVE_TOOLS = os.environ.get("AGENT_TOOLS", "0") == "1"
 
 
+PROXY_PATIENCE = float(os.environ.get("PROXY_PATIENCE_SEC", 240))
+
+
 class BudgetExhausted(Exception):
     pass
 
@@ -236,10 +239,13 @@ class MeteredModel(Model):
                   "reasoning_chars": len(reasoning), "in": inp, "out": out, "cost": cost,
                   "sec": round(time.time() - t0, 2), "finish": resp.finish_reason})
             return resp
-        # one call failing six times may be a glitch; three calls in a row means the
-        # proxy has stopped answering (budget gone) and the run should wind down
+        # One call failing six times may be a glitch. The run winds down only when calls
+        # have kept failing for four minutes: a proxy that hiccups for a minute must not
+        # cost the remaining tasks, and the ones that failed meanwhile are retried later.
         owner.fail_streak += 1
-        if owner.fail_streak >= 3:
+        if owner.fail_streak == 1:
+            owner.fail_since = time.time()
+        if owner.fail_streak >= 3 and time.time() - owner.fail_since >= PROXY_PATIENCE:
             ledger.dead = True
         raise ProxyDown(str(last_err))
 
@@ -313,6 +319,7 @@ class LLM:
         self.base0 = self.base
         self.v1_state = "untried"  # untried -> trying -> done
         self.fail_streak = 0
+        self.fail_since = 0.0
         self.n_calls: dict = {}
         self._models: dict = {}
 

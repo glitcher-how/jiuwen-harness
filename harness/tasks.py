@@ -343,15 +343,22 @@ def _an_data(t: Task) -> None:
              and f != "answer.txt"]
     mentioned = []
     for f in dict.fromkeys(re.findall(r"([\w./-]*\w\.(?:csv|tsv|json))\b", t.instruction)):
+        # the task may spell the path from above the working directory ("workspace/input/x.json")
+        f = re.sub(r"^(?:\./)?(?:workspace/)?", "", f)
         if os.path.exists(os.path.join(t.cwd, f)):
-            mentioned.append(f)
+            if f not in mentioned:
+                mentioned.append(f)
             continue
-        # maybe it sits in a subfolder (data/sales.csv): look through the whole task
+        # maybe it sits in a subfolder (data/sales.csv): look through the whole task.
+        # Several files may share the name (current/ and archive/): the one whose path
+        # ends like the mention wins, never simply the first one found.
         base = os.path.basename(f)
-        hits = [os.path.relpath(os.path.join(dp, base), t.cwd)
+        hits = [os.path.relpath(os.path.join(dp, base), t.cwd).replace(os.sep, "/")
                 for dp, _, fns in os.walk(t.dir) if base in fns]
+        hits.sort(key=lambda h: (not h.endswith(f), len(h)))
         if hits:
-            mentioned.append(hits[0])
+            if hits[0] not in mentioned:
+                mentioned.append(hits[0])
         else:
             t.p_feasible, t.why_infeasible = 0.05, f"{f} is missing"
             t.certain = True
@@ -361,7 +368,8 @@ def _an_data(t: Task) -> None:
         p = os.path.join(t.cwd, f)
         if not f.lower().endswith((".csv", ".tsv")):
             with open(p, encoding="utf-8", errors="replace") as fh:
-                summ.append(f"{f}: {fh.read(600)}")
+                note = " (a JSON list of objects is already parsed in `tables`)" if f.lower().endswith(".json") else ""
+                summ.append(f"{f}{note}: {fh.read(600)}")
             continue
         with open(p, encoding="utf-8", errors="replace", newline="") as fh:
             rows = list(csv.reader(fh, delimiter=sniff_delimiter(p)))
@@ -377,7 +385,9 @@ def _an_data(t: Task) -> None:
         for i, col in enumerate(head):
             col_vals = [r[i] for r in body if i < len(r)]
             uniq = sorted(set(col_vals))
-            numeric = all(re.fullmatch(r"-?\d+(\.\d+)?", v or "0") for v in col_vals)
+            # 007 and 7 are different codes: such a column is text, not numbers
+            numeric = all(re.fullmatch(r"-?\d+(\.\d+)?", v.strip() or "0") for v in col_vals) \
+                and not any(re.fullmatch(r"-?0\d+", v.strip()) for v in col_vals)
             if numeric:
                 nums = [float(v) for v in col_vals if v]
                 if nums:

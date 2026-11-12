@@ -13,7 +13,7 @@ import threading
 from typing import Optional
 
 from .llm import LLM, MODELS, NATIVE_TOOLS, BudgetExhausted, ProxyDown
-from .sandbox import clip, run_python, run_shell, run_test_file
+from .sandbox import Run, clip, run_python, run_shell, run_test_file
 from .tasks import Task
 
 IMPOSSIBLE = "IMPOSSIBLE"
@@ -96,7 +96,12 @@ async def _program(task: Task, llm: LLM, user: str, model: str, max_tokens: int 
     state = {}
 
     def handler(code: str) -> str:
-        r = run_python(PRELUDE.get(task.kind, "") + code, task.cwd, timeout=30)
+        if task.kind == "data_analysis" and not re.search(r"\b(?:rows|tables)\b|\bopen\s*\(|read_csv|glob", code):
+            # the model saw three sample rows and typed the rest of the table from imagination
+            r = Run(1, "", "The program does not read the data. Use the preloaded `tables`; "
+                           "never type table contents into the program.")
+        else:
+            r = run_python(PRELUDE.get(task.kind, "") + code, task.cwd, timeout=30)
         state["run"] = r
         return clip(r.out if r.ok else (r.err or r.out or "no output"), 800)
 
@@ -314,17 +319,52 @@ async def solve_data(task: Task, llm: LLM) -> Optional[str]:
                                 retry_tokens=think_cap)], task.prior)
     # A first program that crashed means the table is not what the cheap model assumed;
     # the second attempt goes to the reasoning model instead of repeating the guess.
-    q = user + f" If a value the answer depends on is blank or missing, print {IMPOSSIBLE}."
+    tail = f" If a value the answer depends on is blank or missing, print {IMPOSSIBLE}."
+    q = user + tail
     try:
-        return await _program(task, llm, q, MODELS["fast"], max_tokens=fast_cap,
-                              retry_model=MODELS["think"], retry_tokens=think_cap)
+        first = await _program(task, llm, q, MODELS["fast"], max_tokens=fast_cap,
+                               retry_model=MODELS["think"], retry_tokens=think_cap)
     except Infeasible:
         if task.deferred:
             raise
-    # The cheap model gives up too easily on a messy table (an empty cell the task itself
-    # tells how to read). Nothing else pointed at an unsolvable task, so "impossible" is
-    # accepted only if the reasoning model, asked from scratch, says the same.
-    return await _program(task, llm, q, MODELS["think"], max_tokens=think_cap)
+        # The cheap model gives up too easily on a messy table (an empty cell the task
+        # itself tells how to read). Nothing else pointed at an unsolvable task, so
+        # "impossible" is accepted only if the reasoning model, asked from scratch, agrees.
+        return await _program(task, llm, q, MODELS["think"], max_tokens=think_cap)
+    if task.deferred:
+        return first
+    # One cheap program is right most of the time, and wrong in ways nothing flags: a
+    # one-liner that takes max minus min instead of the largest step between neighbours.
+    # As in math, a second cheap solution written under a different instruction is the
+    # check, and the reasoning model is called only when the two disagree.
+    q2 = user.replace("Write the shortest code that prints the answer; do not reread files.",
+                      "Write a plain step-by-step program: one statement per rule of the task, in the "
+                      "stated order, with explicit loops; print only the answer. Use the preloaded "
+                      "tables.") + tail
+    try:
+        try:
+            second = await _program(task, llm, q2, MODELS["fast"], max_tokens=fast_cap)
+        except Infeasible:
+            second = IMPOSSIBLE
+        except RuntimeError:
+            return first  # a crash of the checker says nothing about the answer
+        if _same_value(first, second):
+            return first
+        try:
+            return await _program(task, llm, q, MODELS["think"], max_tokens=think_cap)
+        except RuntimeError:
+            return first
+    except (BudgetExhausted, ProxyDown):
+        return first
+
+
+def _same_value(a: str, b: str) -> bool:
+    if a.strip() == b.strip():
+        return True
+    try:
+        return float(a) == float(b)
+    except ValueError:
+        return False
 
 
 # ------------------------------------------------------------------ search
