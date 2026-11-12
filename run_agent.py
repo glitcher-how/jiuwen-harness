@@ -77,8 +77,8 @@ def normalize_answer(task, ans: str) -> str:
     if check == "exact_int" or (not check and task.kind in ("math", "data_analysis")):
         s = ans.strip().strip("'\"`")
         s = re.sub(r"(?<=\d)[,_  ](?=\d{3}\b)", "", s)   # thousands separators
-        if re.fullmatch(r"[-+]?\d+(\.0+)?", s):
-            return str(int(s.split(".")[0]))
+        if re.fullmatch(r"[-+]?\d+(\.0+)?", s) and not (check != "exact_int" and re.match(r"[-+]?0\d", s)):
+            return str(int(s.split(".")[0]))  # '0011' with no declared check is a code, not eleven
         nums = re.findall(r"(?<![\w.])[-+]?\d+(?:\.\d+)?(?![\w.])", s)
         if check == "exact_int" and len(nums) == 1 and re.fullmatch(r"[-+]?\d+(\.0+)?", nums[0]):
             return str(int(nums[0].split(".")[0]))                   # '389 boxes'

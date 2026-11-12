@@ -397,11 +397,12 @@ def _an_data(t: Task) -> None:
         # a short literal in quotes; an apostrophe inside a word (employee's) is not a quote
         quoted = re.findall(r"(?<![A-Za-z])'([^'\n]{1,40})'(?![A-Za-z])|\"([^\"\n]{1,40})\"", t.question)
         allvals = set().union(*values.values()) if values else set()
-        for a, b in quoted:
+        short = len(t.question) <= 400
+        for a, b in (quoted if short else []):
             v = a or b
             if values and v not in allvals and v not in head:
                 t.p_feasible, t.why_infeasible = 0.08, f"value {v!r} not present in {f}"
-        for c in re.findall(r"\b(?:the\s+)?([A-Za-z_]+)\s+column\b", t.question):
+        for c in (re.findall(r"\b(?:the\s+)?([A-Za-z_]+)\s+column\b", t.question) if short else []):
             if c.lower() not in ("the", "a", "this") and c not in head:
                 t.p_feasible, t.why_infeasible = 0.05, f"column {c!r} not in {f}"
         # explicit claims like "(20 rows)" that disagree with the file

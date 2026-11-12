@@ -196,6 +196,13 @@ async def solve_math(task: Task, llm: LLM) -> Optional[str]:
         answer = first if first is not None and first == second else await attempt(
             model=MODELS["think"], max_tokens=think_cap, system=SYS_STEPS,
             retry_model=MODELS["think"], retry_tokens=think_cap)
+        seen = [a for a in (first, second) if a is not None]
+        if answer is not None and len(seen) == 2 and answer not in seen:
+            # three solutions, three answers: the arbiter is as likely wrong as the others.
+            # One more reasoning solution with the other prompt; an answer given twice wins.
+            fourth = await attempt(model=MODELS["think"], max_tokens=think_cap)
+            if fourth in seen:
+                answer = fourth
     except (BudgetExhausted, ProxyDown):
         # out of budget before the answer was confirmed: an unconfirmed answer can
         # still score, no answer cannot
@@ -222,22 +229,55 @@ def _conv(v):
     if _re.fullmatch(r'-?(0|[1-9]\d*)\.\d+', s):
         return float(s)
     return v  # '007', '1e3', 'nan' are codes and words, not numbers
-tables = {}
+class _Cell:
+    # A numeric cell is a number, but programs written for text cells call .strip() or
+    # .lower() on it first ("trim every cell"); those calls get the original text back.
+    def strip(self, *a): return self._s.strip(*a)
+    def lstrip(self, *a): return self._s.lstrip(*a)
+    def rstrip(self, *a): return self._s.rstrip(*a)
+    def lower(self): return self._s.lower()
+    def upper(self): return self._s.upper()
+    def replace(self, *a): return self._s.replace(*a)
+    def split(self, *a): return self._s.split(*a)
+    def startswith(self, *a): return self._s.startswith(*a)
+    def endswith(self, *a): return self._s.endswith(*a)
+    def isdigit(self): return self._s.strip().isdigit()
+class _Int(_Cell, int):
+    def __new__(cls, v, s):
+        o = int.__new__(cls, v); o._s = s; return o
+class _Float(_Cell, float):
+    def __new__(cls, v, s):
+        o = float.__new__(cls, v); o._s = s; return o
+def _cell(v):
+    c = _conv(v)
+    return _Int(c, v) if type(c) is int else _Float(c, v) if type(c) is float else c
+class _Tables(dict):
+    # 'data/x.csv', 'data\\x.csv', './data/x.csv', 'workspace/data/x.csv' and a unique 'x.csv' are one file
+    def _key(self, k):
+        k = _re.sub(r'^(?:[.]/)?(?:workspace/)?', '', str(k).replace(chr(92), '/'))
+        if dict.__contains__(self, k):
+            return k
+        hits = [x for x in self if x.rsplit('/', 1)[-1] == k.rsplit('/', 1)[-1]]
+        return hits[0] if len(hits) == 1 else k
+    def __getitem__(self, k): return dict.__getitem__(self, self._key(k))
+    def __contains__(self, k): return dict.__contains__(self, self._key(k))
+    def get(self, k, d=None): return dict.get(self, self._key(k), d)
+tables = _Tables()
 for _f in sorted(_glob.glob('**/*.csv', recursive=True) + _glob.glob('**/*.tsv', recursive=True)):
     with open(_f, newline='', encoding='utf-8', errors='replace') as _h:
         _head = _h.readline()
         _h.seek(0)
         _delim = max(',;\t|', key=_head.count)
         _delim = _delim if _head.count(_delim) else ','
-        tables[_f] = [{k: _conv(v) for k, v in r.items()}
-                      for r in _csv.DictReader(_h, delimiter=_delim)]
+        tables[_f.replace(chr(92), '/')] = [{k: _cell(v) for k, v in r.items()}
+                                            for r in _csv.DictReader(_h, delimiter=_delim)]
 for _f in sorted(_glob.glob('**/*.json', recursive=True)):
     try:
         import json as _json
         with open(_f, encoding='utf-8') as _h:
             _d = _json.load(_h)
         if isinstance(_d, list) and _d and all(isinstance(_r, dict) for _r in _d):
-            tables[_f] = _d
+            tables[_f.replace(chr(92), '/')] = _d
     except Exception:
         pass
 rows = next(iter(tables.values())) if len(tables) == 1 and not _glob.glob('**/*.json', recursive=True) else None
@@ -319,20 +359,22 @@ async def solve_search(task: Task, llm: LLM) -> Optional[str]:
                            task.prior)
     contexts = [task.context.get("kb_wide") or task.context.get("kb", "")]
     whole = task.context.get("kb_all")
-    if whole and whole != contexts[0] and not task.deferred:
+    if whole and whole != contexts[0]:
         # Linked cards are found by walking forward from the names in the question.
         # Counts, extremes and reverse links ("who works at X") need cards nobody
         # points to, and "not in these cards" is not "not in the base".
         if _WHOLE_BASE.search(task.question):
             contexts = [whole]
-        elif len(whole) <= 20000:
+        elif len(whole) <= 20000 and not task.deferred:
             contexts.append(whole)
     # The model without reasoning answers lookups well but picks the wrong card when the
     # question needs filtering or comparing, and guesses when the KB is silent. Unfamiliar
-    # questions therefore go to the reasoning model; a probably-infeasible one stays cheap.
-    model = MODELS["fast"] if task.deferred else MODELS["think"]
+    # questions therefore go to the reasoning model. A task marked doubtful by its wording
+    # gets the same model: the mark is a guess (a capitalised field name looks like an
+    # unknown entity), and a cheap wrong answer costs the whole task.
+    model = MODELS["think"]
     for kb in contexts:
-        limit = 24 if task.deferred else _budget(kb + task.question, 1200, 4, 12000)
+        limit = _budget(kb + task.question, 1200, 4, 12000)
         try:
             return await _search_once(task, llm, kb, model, limit)
         except Infeasible:
@@ -364,6 +406,10 @@ def kb_spelling(ans: str, kb: str) -> str:
             values.setdefault(m.group(1).lower(), m.group(1))
     if ans.lower() in values:
         return values[ans.lower()]
+    # the cleaning above strips a final period; "Pier-7 / East." is the value, not a sentence
+    tail = [v for k, v in values.items() if k.rstrip(".!?;:, ") == ans.lower().rstrip(".!?;:, ")]
+    if len(tail) == 1:
+        return tail[0]
     inside = [v for k, v in values.items()
               if re.search(r"(?<!\w)" + re.escape(k) + r"(?!\w)", ans.lower())]
     longest = max(inside, key=len, default=None)
@@ -615,8 +661,20 @@ async def _audit(task: Task, llm: LLM, cwd: str, target: str, tests, model: str)
 
 def _target(task: Task, tests) -> Optional[str]:
     targets = [f for f in os.listdir(task.cwd) if f.endswith(".py") and f not in tests]
-    m = re.search(r"bugs? in ([\w./-]+\.py)", task.instruction)
-    return m.group(1) if m and m.group(1) in targets else (targets[0] if len(targets) == 1 else None)
+    if len(targets) == 1:
+        return targets[0]
+    # "the bugs are in X.py" / "all three defects are in X.py", then "Repair X.py"
+    for pat in (r"(?:bugs?|defects?|errors?|mistakes?|faults?)\s+(?:(?:is|are|lie|lies|sit|sits)\s+)?(?:all\s+)?in\s+`?([\w./-]+\.py)",
+                r"\b(?:repair|fix|correct|debug)\s+(?:the\s+)?(?:module\s+|file\s+)?`?([\w./-]+\.py)"):
+        m = re.search(pat, task.instruction, re.I)
+        if m and m.group(1) in targets:
+            return m.group(1)
+    # otherwise the module the others import: the tests reach it through them
+    srcs = {f: open(os.path.join(task.cwd, f), encoding="utf-8", errors="replace").read() for f in targets}
+    used = [f for f in targets
+            if any(re.search(r"^\s*(?:from|import)\s+" + re.escape(f[:-3]) + r"\b", s, re.M)
+                   for g, s in srcs.items() if g != f)]
+    return used[0] if len(used) == 1 else None
 
 
 def _review_cap(src: str) -> int:
