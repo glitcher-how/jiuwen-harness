@@ -232,28 +232,35 @@ async def solve_math(task: Task, llm: LLM) -> Optional[str]:
 # boilerplate (about half the output tokens). Numbers are already converted.
 # 1.1 * 50 is 55.00000000000001 in binary floating point, so math.ceil gives 56, and
 # 0.35 * 180 is 62.99999999999999, so math.floor gives 62. "ceil(110% of the balance)" is
-# an ordinary step of these problems; a value within 1e-9 of an integer is that integer.
+# an ordinary step of these problems; a float a few units in the last place away from an
+# integer is that integer.
 # round() is replaced by rounding half away from zero for the same reason.
 _EXACT = r'''
-import math as _m
+import math as _m, builtins as _bi
+from decimal import Decimal as _D, ROUND_HALF_UP as _HU
 def _near(f):
     def g(x):
-        if isinstance(x, float) and x == x and abs(x) < 1e15:
-            r = round(x)
-            if abs(x - r) < 1e-9:
+        # only a float that differs from an integer by rounding error of the arithmetic
+        # (a few units in the last place) is snapped; 1/2000000000 stays what it is
+        if type(x) is float and x == x and abs(x) < 1e15:
+            r = _bi.round(x)
+            if abs(x - r) <= 64 * _m.ulp(max(abs(r), 1.0)):
                 return r
         return f(x)
     return g
 _m.floor, _m.ceil, _m.trunc = _near(_m.floor), _near(_m.ceil), _near(_m.trunc)
-import builtins as _bi
-from decimal import Decimal as _D, ROUND_HALF_UP as _HU
 def round(x, n=None):
     # Python rounds halves to the even neighbour: round(20.5) is 20 and round(2.5) is 2.
     # The problems mean school rounding ("an exact midpoint goes up"), and the programs
-    # written for them call round() expecting exactly that.
-    if type(x) in (int, float) and x == x and abs(x) < 1e15:
-        d = _D(repr(x)).quantize(_D(1).scaleb(-(n or 0)), rounding=_HU)
-        return int(d) if n is None or type(x) is int else float(d)
+    # written for them call round() expecting exactly that. Anything unusual (other
+    # types, huge values, odd digit counts) keeps the built-in behaviour.
+    try:
+        if type(x) in (int, float) and x == x and abs(x) < 1e15 \
+                and (n is None or (type(n) is int and -15 <= n <= 15)):
+            d = _D(repr(x)).quantize(_D(1).scaleb(-(n or 0)), rounding=_HU)
+            return int(d) if n is None or type(x) is int else float(d)
+    except Exception:
+        pass
     return _bi.round(x) if n is None else _bi.round(x, n)
 '''
 
@@ -327,8 +334,10 @@ for _t in _raw.values():
         for _k, _v in _r.items():
             if isinstance(_v, str) and _v.strip():
                 _cols.setdefault(_k, set()).add(_v.strip())
+_jkeys = {_k for _t in _js.values() for _r in _t for _k, _v in _r.items() if isinstance(_v, str)}
 _text = {_k for _k, _vs in _cols.items()
-         if any(_re.fullmatch(r'-?0\d+', _v) for _v in _vs) or (len(_vs) > 1 and _vs <= _jstr)}
+         if any(_re.fullmatch(r'-?0\d+', _v) for _v in _vs)
+         or (_vs <= _jstr and (len(_vs) > 1 or _k in _jkeys))}
 tables = _Tables()
 for _f, _t in _raw.items():
     tables[_f] = [{k: (v if k in _text else _cell(v)) for k, v in r.items()} for r in _t]
