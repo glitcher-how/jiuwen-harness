@@ -389,7 +389,7 @@ def _an_data(t: Task) -> None:
             numeric = all(re.fullmatch(r"-?\d+(\.\d+)?", v.strip() or "0") for v in col_vals) \
                 and not any(re.fullmatch(r"-?0\d+", v.strip()) for v in col_vals)
             if numeric:
-                nums = [float(v) for v in col_vals if v]
+                nums = [float(v) for v in col_vals if v.strip()]
                 if nums:
                     blank = sum(1 for v in col_vals if not v.strip())
                     lines.append(f"{col}: numeric {min(nums):g}..{max(nums):g}"

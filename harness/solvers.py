@@ -214,6 +214,11 @@ async def solve_math(task: Task, llm: LLM) -> Optional[str]:
         answer = next((a for a in (first, second) if a not in (None, IMPOSSIBLE)), None)
         if answer is None:
             raise
+    if answer in (None, IMPOSSIBLE):
+        # A wrong answer costs nothing more than no answer, and the tokens are spent
+        # already: if any solution produced a value, the value is submitted even when
+        # the others called the problem unsolvable (they misread it as often as not).
+        answer = next((a for a in (first, second) if a not in (None, IMPOSSIBLE)), answer)
     if answer is None:
         raise RuntimeError("program failed")
     if answer == IMPOSSIBLE:
@@ -225,7 +230,34 @@ async def solve_math(task: Task, llm: LLM) -> Optional[str]:
 
 # Runs before the model's code, so the model writes one expression instead of csv
 # boilerplate (about half the output tokens). Numbers are already converted.
-PRELUDE = {"data_analysis": r'''
+# 1.1 * 50 is 55.00000000000001 in binary floating point, so math.ceil gives 56, and
+# 0.35 * 180 is 62.99999999999999, so math.floor gives 62. "ceil(110% of the balance)" is
+# an ordinary step of these problems; a value within 1e-9 of an integer is that integer.
+# round() is replaced by rounding half away from zero for the same reason.
+_EXACT = r'''
+import math as _m
+def _near(f):
+    def g(x):
+        if isinstance(x, float) and x == x and abs(x) < 1e15:
+            r = round(x)
+            if abs(x - r) < 1e-9:
+                return r
+        return f(x)
+    return g
+_m.floor, _m.ceil, _m.trunc = _near(_m.floor), _near(_m.ceil), _near(_m.trunc)
+import builtins as _bi
+from decimal import Decimal as _D, ROUND_HALF_UP as _HU
+def round(x, n=None):
+    # Python rounds halves to the even neighbour: round(20.5) is 20 and round(2.5) is 2.
+    # The problems mean school rounding ("an exact midpoint goes up"), and the programs
+    # written for them call round() expecting exactly that.
+    if type(x) in (int, float) and x == x and abs(x) < 1e15:
+        d = _D(repr(x)).quantize(_D(1).scaleb(-(n or 0)), rounding=_HU)
+        return int(d) if n is None or type(x) is int else float(d)
+    return _bi.round(x) if n is None else _bi.round(x, n)
+'''
+
+PRELUDE = {"math": _EXACT, "data_analysis": _EXACT + r'''
 import csv as _csv, glob as _glob, re as _re
 def _conv(v):
     s = v.strip() if isinstance(v, str) else ''
@@ -285,7 +317,7 @@ for _f in sorted(_glob.glob('**/*.json', recursive=True)):
     except Exception:
         pass
 # A column is a column of codes, and stays text as a whole, if one of its values has a
-# leading zero (007 is not 7) or if most of its values are spelled as strings in a JSON file (the key
+# leading zero (007 is not 7) or if every one of its values is spelled as a string in a JSON file (the key
 # of a join: "7" there must equal the cell here). The same column name in another table
 # follows, so that a join between two tables compares like with like.
 _jstr = {_v.strip() for _t in _js.values() for _r in _t for _v in _r.values() if isinstance(_v, str)}
@@ -296,7 +328,7 @@ for _t in _raw.values():
             if isinstance(_v, str) and _v.strip():
                 _cols.setdefault(_k, set()).add(_v.strip())
 _text = {_k for _k, _vs in _cols.items()
-         if any(_re.fullmatch(r'-?0\d+', _v) for _v in _vs) or 2 * len(_vs & _jstr) >= len(_vs)}
+         if any(_re.fullmatch(r'-?0\d+', _v) for _v in _vs) or (len(_vs) > 1 and _vs <= _jstr)}
 tables = _Tables()
 for _f, _t in _raw.items():
     tables[_f] = [{k: (v if k in _text else _cell(v)) for k, v in r.items()} for r in _t]
@@ -369,8 +401,8 @@ async def solve_data(task: Task, llm: LLM) -> Optional[str]:
             return first
         try:
             return await _program(task, llm, q, MODELS["think"], max_tokens=think_cap)
-        except RuntimeError:
-            return first
+        except (RuntimeError, Infeasible):
+            return first  # a value in hand beats "impossible": a wrong answer is not penalised
     except (BudgetExhausted, ProxyDown):
         return first
 
@@ -379,8 +411,9 @@ def _same_value(a: str, b: str) -> bool:
     if a.strip() == b.strip():
         return True
     try:
-        return float(a) == float(b)
-    except ValueError:
+        from decimal import Decimal, InvalidOperation
+        return Decimal(a.strip()) == Decimal(b.strip())  # exact: float would merge 2**53 + 1 with 2**53
+    except (InvalidOperation, ValueError):
         return False
 
 
